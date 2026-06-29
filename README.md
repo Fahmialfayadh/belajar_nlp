@@ -11,6 +11,9 @@
 ## Road Map
 
 ```
+MODUL 0: Pengantar
+  └── Lanskap AI 2026 (konteks sebelum masuk teori)
+       ↓
 FASE 1: Fondasi
   └── Math Terapan (Dot Product, Cosine, Ruang Vektor)
   └── Tokenization Modern (BPE, SentencePiece)
@@ -29,9 +32,13 @@ FASE 3: Sistem
   └── Evaluasi: RAGAS & LLM-as-a-Judge
        ↓
 FASE 4: Agentic AI
-  └── AI Agents & Orkestrasi (LangGraph, MCP, A2A)
-  └── Tool Use / Function Calling
-  └── Multi-Agent Systems
+  └── AI Agents (Anatomi, ReAct, Function Calling)
+  └── MCP & A2A (Infrastruktur Standar untuk Agent)
+  └── Agent di Produksi (Orkestrasi, Evaluasi, Keamanan)
+       ↓
+STUDI KASUS: Bedah Model Terkini
+  └── DeepSeek-V4 (Hybrid Attention, MoE, mHC)
+  └── Qwen3 (Thinking Budget, GRPO, Distillation)
 ```
 
 Setiap fase **membangun di atas fase sebelumnya**. Jangan loncat.
@@ -39,6 +46,9 @@ Setiap fase **membangun di atas fase sebelumnya**. Jangan loncat.
 ---
 
 ## 📂 Struktur Modul
+
+### [🗺️ Modul 0: Pengantar — Lanskap AI 2026](modul-0-pengantar/)
+- [Pengantar — Peta Sebelum Perjalanan](modul-0-pengantar/pengantar-ai-2026.md)
 
 ### [📦 Fase 1: Fondasi Matematika & Embeddings](fase-1-fondasi/)
 - [Modul 1.1 — Matematika Terapan](fase-1-fondasi/modul-1.1-matematika-terapan.md)
@@ -56,7 +66,13 @@ Setiap fase **membangun di atas fase sebelumnya**. Jangan loncat.
 - [Modul 3.4 — Evaluasi RAG](fase-3-sistem/modul-3.4-evaluasi-rag.md)
 
 ### [📦 Fase 4: Agentic AI & Orkestrasi](fase-4-agentic/)
-- [Modul 4.1 — AI Agents](fase-4-agentic/modul-4.1-ai-agents.md)
+- [Modul 4.1 — AI Agents: Dari Chatbot ke Sistem Otonom](fase-4-agentic/modul-4.1-ai-agents.md)
+- [Modul 4.2 — MCP & A2A: Infrastruktur Standar untuk Agent](fase-4-agentic/modul-4.2-mcp-a2a.md)
+- [Modul 4.3 — Agent di Produksi: Orkestrasi, Evaluasi & Keamanan](fase-4-agentic/modul-4.3-agent-produksi.md)
+
+### [📑 Studi Kasus: Bedah Model Terkini](studi-kasus/)
+- [DeepSeek-V4 — Efisiensi di Era Konteks Sejuta Token](studi-kasus/deepseek-v4.md)
+- [Qwen3 — Thinking dan Non-Thinking dalam Satu Model](studi-kasus/qwen-3.md)
 
 ---
 
@@ -65,6 +81,9 @@ Setiap fase **membangun di atas fase sebelumnya**. Jangan loncat.
 ### Apa yang Sudah Kamu Pelajari
 
 ```
+✅ MODUL 0: Pengantar
+   └── Lanskap AI 2026, 5 Level AI, tren industri
+
 ✅ FASE 1: Fondasi
    ├── Math: Dot Product, Cosine Similarity, Ruang Berdimensi Tinggi
    ├── Tokenization: BPE, SentencePiece, implikasi token ≠ kata
@@ -82,10 +101,15 @@ Setiap fase **membangun di atas fase sebelumnya**. Jangan loncat.
    └── Evaluasi: RAGAS, LLM-as-a-Judge
 
 ✅ FASE 4: Agentic AI
-   ├── AI Agent: Anatomy, Memory, Tools
-   ├── ReAct: Loop Think-Act-Observe
-   ├── Function Calling, MCP & A2A
-   └── Multi-Agent: Kolaborasi agen spesialis
+   ├── AI Agent: Anatomy, ReAct, Function Calling, Multi-Agent
+   ├── MCP & A2A: Protokol standar agent↔tool dan agent↔agent
+   ├── Orkestrasi: LangGraph, state machines, checkpointing
+   ├── Evaluasi: Observability, tracing, regression testing
+   └── Keamanan: Prompt injection, least privilege, guardrails
+
+📑 STUDI KASUS
+   ├── DeepSeek-V4: Hybrid Attention, mHC, Muon, CSA/HCA
+   └── Qwen3: Thinking Budget, GRPO, Strong-to-Weak Distillation
 ```
 
 ### Langkah Berikutnya yang Disarankan

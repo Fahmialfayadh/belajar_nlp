@@ -1,0 +1,18 @@
+{
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/node_modules/**": true,
+        "**/.venv/**": true,
+        "**/venv/**": true,
+        "**/env/**": true,
+        "**/__pycache__/**": true
+    },
+    "search.exclude": {
+        "**/node_modules/**": true,
+        "**/.venv/**": true,
+        "**/venv/**": true,
+        "**/env/**": true,
+        "**/__pycache__/**": true
+    }
+}

@@ -117,10 +117,10 @@ def get_embedding(teks):
     return F.normalize(embeddings, p=2, dim=1)
 
 # --- EKSPERIMEN: Apakah Contextual Embeddings Menangkap Ambiguitas? ---
-kalimat_buah    = "Saya makan apel merah yang sangat manis."
-kalimat_tech    = "Apel meluncurkan produk baru di konferensi tahunan mereka."
-kalimat_samsung = "Samsung merilis smartphone flagship terbaru bulan ini."
-kalimat_mangga  = "Mangga dan apel adalah buah favoritku untuk dijus."
+kalimat_buah    = "An apple is a very popular fruit around the world."
+kalimat_tech    = "Apple is a very popular tech brand around the world."
+kalimat_samsung = "Samsung produces new smartphones and electronic devices."
+kalimat_mangga  = "Mangoes and apples are very popular fruits around the world."
 
 emb_buah    = get_embedding(kalimat_buah)
 emb_tech    = get_embedding(kalimat_tech)
@@ -133,9 +133,9 @@ def sim(a, b):
 
 print("=== Kemiripan Semantik ===")
 print(f"'apel buah' ↔ 'apel tech'    : {sim(emb_buah, emb_tech):.4f}")   # harusnya RENDAH
-print(f"'apel tech' ↔ 'Samsung'       : {sim(emb_tech, emb_samsung):.4f}") # harusnya TINGGI
 print(f"'apel buah' ↔ 'mangga & apel': {sim(emb_buah, emb_mangga):.4f}")  # harusnya TINGGI
 print(f"'apel buah' ↔ 'Samsung'       : {sim(emb_buah, emb_samsung):.4f}")# harusnya RENDAH
+print(f"'apel tech' ↔ 'Samsung'       : {sim(emb_tech, emb_samsung):.4f}") # LEBIH  TINGGI DARI APLE BUAH
 ```
 
 > **Yang perlu kamu amati**: Apakah model berhasil memisahkan "apel buah" dari "apel perusahaan"? Jika similarity antara `kalimat_buah` dan `kalimat_mangga` lebih tinggi dari `kalimat_buah` dan `kalimat_tech` — model berhasil memahami konteks.
