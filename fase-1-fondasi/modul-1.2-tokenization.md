@@ -112,6 +112,73 @@ Hasilnya:
 - "Hello world" → ["▁Hello", "▁world"]
 - "Helloworld" → ["▁Hello", "world"] *(perhatikan: tidak ada `▁` di "world" karena tidak ada spasi sebelumnya)*
 
+#### Deep-Dive: SentencePiece Punya Dua Mode
+
+Ini sering dilewatkan — SentencePiece bukan cuma "BPE tanpa spasi":
+
+**Mode 1 — BPE**: Sama seperti BPE standar yang sudah kamu pelajari, tapi dijalankan pada aliran byte mentah tanpa asumsi spasi. Dipakai oleh GPT-series, Llama.
+
+**Mode 2 — Unigram Language Model**: Pendekatan yang *sepenuhnya berbeda* dari BPE:
+
+```
+BPE:         Bottom-up  → mulai dari karakter, GABUNG pasangan tersering
+Unigram LM:  Top-down   → mulai dari vocabulary besar, HAPUS token yang paling sedikit
+                           mengurangi likelihood corpus
+```
+
+Cara kerja Unigram LM:
+1. Mulai dengan vocabulary besar (~1 juta kandidat token)
+2. Untuk setiap token, hitung: *"Berapa besar penurunan likelihood corpus jika token ini dihapus?"*
+3. Hapus token yang paling sedikit mengurangi likelihood (token yang paling "tidak berguna")
+4. Ulangi sampai mencapai ukuran vocabulary target
+
+**Mengapa ini menarik?** Unigram LM bisa menghasilkan **multiple valid tokenizations** untuk satu kata yang sama, sehingga lebih robust terhadap noise. Model seperti Gemini dan T5 menggunakan mode ini.
+
+---
+
+### 📖 Update 2026: Byte Latent Transformer (BLT) — Masa Depan Tanpa Tokenizer
+
+Ini adalah *breakthrough* terbaru yang patut kamu ketahui, meskipun belum mainstream.
+
+**Masalah fundamental semua tokenizer**: Vocabulary tetap (fixed vocabulary) selalu punya batasan:
+- Kata baru yang tidak ada di training data → dipecah secara sub-optimal
+- Bahasa non-Latin (Arab, Thai, Jepang) sering diperlakukan kurang efisien
+- Typo kecil bisa menghasilkan tokenisasi yang sangat berbeda
+
+**Byte Latent Transformer (BLT)** dari Meta membuang konsep tokenizer tetap sepenuhnya:
+
+```
+Tokenizer tradisional:
+  "Halo dunia" → [fixed_token_1, fixed_token_2]  (vocabulary statis)
+
+BLT:
+  "Halo dunia" → [72, 97, 108, 111, 32, 100, ...]  (raw UTF-8 bytes!)
+                  → [patch_1, patch_2, ...]  (dynamic grouping berdasarkan entropy)
+```
+
+Cara BLT mengelompokkan bytes menjadi patches:
+- Bagian teks yang **mudah diprediksi** (kata umum, pola berulang) → dikompresi jadi patch besar
+- Bagian teks yang **sulit diprediksi** (nama, angka, kode, kata asing) → patch kecil, mendapat lebih banyak compute
+
+**Keunggulan BLT**:
+- **Tidak ada OOV** — semua teks bisa diproses karena bekerja di level byte
+- **Sempurna untuk multilingual** — semua bahasa diperlakukan setara
+- **Adaptive compute** — model mengalokasikan lebih banyak "pemikiran" untuk bagian yang sulit
+
+**Status**: Masih riset, belum di-adopt di model produksi utama. Tapi arahnya jelas — masa depan mungkin tanpa tokenizer tetap.
+
+#### Parity-Aware BPE: Mengurangi "Token Tax" Multilingual
+
+Masalah: tokenizer yang dilatih dominan pada data Inggris membuat bahasa lain "lebih mahal":
+
+```
+Kalimat setara:
+  English:   "I love programming"  → 3 tokens
+  Indonesia: "Saya suka programming" → 5 tokens  ← 67% lebih banyak!
+```
+
+**Parity-Aware BPE** (2025-2026) secara eksplisit mengoptimasi merge rules agar **panjang token seimbang antar bahasa** — bukan cuma memaksimalkan kompresi pada bahasa mayoritas. Ini masalah fairness: pengguna berbahasa Indonesia seharusnya tidak membayar 40% lebih mahal untuk API LLM.
+
 ---
 
 ### 📖 Implikasi Penting yang Sering Diabaikan
@@ -186,15 +253,85 @@ Cari tahu tentang **"tokenizer fertility"** — metrik yang mengukur rata-rata t
 
 ---
 
+### 🔬 Eksperimen Google Colab: Tokenizer Battle Royale
+
+Copy-paste ke Google Colab — tidak butuh GPU.
+
+```python
+# ============================================================
+# EKSPERIMEN: Tokenizer Battle — 5 Tokenizer Head-to-Head
+# ============================================================
+# Bandingkan efisiensi tokenizer untuk Bahasa Indonesia vs Inggris
+# Ukur "token tax" — berapa % lebih mahal bahasa Indonesia?
+
+!pip install -q transformers tiktoken sentencepiece protobuf
+
+from transformers import AutoTokenizer
+import tiktoken
+
+# Kalimat test paralel (makna setara Indonesia ↔ Inggris)
+test_pairs = [
+    ("Pemerintah Indonesia mengumumkan kebijakan baru tentang energi terbarukan.",
+     "The Indonesian government announced new policies on renewable energy."),
+    ("Mahasiswa itu sedang mengerjakan tugas akhirnya di perpustakaan kampus.",
+     "The student was working on their final thesis at the campus library."),
+    ("Kecerdasan buatan telah mengubah cara kita berinteraksi dengan teknologi.",
+     "Artificial intelligence has changed how we interact with technology."),
+    ("Dia mempertanggungjawabkan perbuatannya di depan pengadilan negeri.",
+     "He was held accountable for his actions before the district court."),
+]
+
+# Load tokenizers (masing-masing mewakili strategi tokenisasi berbeda)
+tokenizers = {
+    "GPT-4o (tiktoken)": tiktoken.encoding_for_model("gpt-4o"),
+    "Llama-3.2": AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B"),
+    "Qwen2.5": AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B"),
+    "Gemma-2": AutoTokenizer.from_pretrained("google/gemma-2-2b"),
+    "BERT multilingual": AutoTokenizer.from_pretrained("bert-base-multilingual-cased"),
+}
+
+print("=" * 90)
+print(f"{'Tokenizer':<22} {'ID Tokens':<12} {'EN Tokens':<12} {'Rasio ID/EN':<12} {'Token Tax %'}")
+print("=" * 90)
+
+for tok_name, tok in tokenizers.items():
+    total_id, total_en = 0, 0
+    for id_text, en_text in test_pairs:
+        if isinstance(tok, tiktoken.Encoding):
+            id_tokens = len(tok.encode(id_text))
+            en_tokens = len(tok.encode(en_text))
+        else:
+            id_tokens = len(tok.encode(id_text))
+            en_tokens = len(tok.encode(en_text))
+        total_id += id_tokens
+        total_en += en_tokens
+    
+    ratio = total_id / total_en
+    tax = (ratio - 1) * 100
+    bar = "🟢" if tax < 15 else "🟡" if tax < 30 else "🔴"
+    print(f"{tok_name:<22} {total_id:<12} {total_en:<12} {ratio:<12.2f} {bar} {tax:+.1f}%")
+
+print("\n💡 INSIGHT: Token Tax = berapa persen lebih mahal Bahasa Indonesia")
+print("   dibanding Inggris pada tokenizer yang sama.")
+print("   Model yang dilatih lebih multilingual → tax lebih rendah.")
+print("\n🔬 COBA: Tambahkan kalimat dengan typo, emoji, atau kode program!")
+```
+
+> **Yang perlu kamu amati**: Perhatikan tokenizer mana yang paling "adil" untuk Bahasa Indonesia. Apakah model yang lebih baru (Qwen, Gemma) lebih baik dari yang lama (BERT)? Ini relevan karena menentukan berapa biaya API yang kamu bayar.
+
+---
+
 ### 📝 Rangkuman
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
 | BPE | Algoritma kompresi yang belajar memecah kata ke subwords dari data |
-| SentencePiece | BPE yang tidak bergantung pada spasi, lebih universal |
+| SentencePiece | BPE/Unigram LM yang tidak bergantung pada spasi, lebih universal |
+| Unigram LM | Top-down approach: mulai besar, hapus token yang tidak berguna |
+| BLT (2026) | Tanpa tokenizer tetap — proses raw bytes dengan dynamic patching |
 | Token ≠ Kata | Bahasa Indonesia lebih "mahal" secara token dari bahasa Inggris |
-| Implikasi Produksi | Tokenizer berpengaruh pada biaya API, chunking, dan perilaku model |
+| Parity-Aware BPE | Optimasi BPE untuk keadilan multilingual (kurangi token tax) |
 
-> **Takeaway utama**: Tokenization bukan langkah teknis yang bisa diabaikan — ia adalah "bahasa" yang digunakan model untuk membaca dunia, dan pilihannya punya konsekuensi nyata.
+> **Takeaway utama**: Tokenization bukan langkah teknis yang bisa diabaikan — ia adalah "bahasa" yang digunakan model untuk membaca dunia, dan pilihannya punya konsekuensi nyata. Masa depan mungkin tanpa tokenizer tetap (BLT), tapi untuk sekarang, pahami cara BPE/SentencePiece bekerja.
 
 **Selanjutnya → Modul 1.3: Embeddings** — Setelah teks jadi token, setiap token diubah menjadi vektor. Tapi tidak semua vektor diciptakan sama.

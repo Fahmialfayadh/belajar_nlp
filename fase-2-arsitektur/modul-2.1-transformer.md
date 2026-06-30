@@ -317,11 +317,38 @@ Posisi 2:  [sin(2/1), cos(2/1), sin(2/100), cos(2/100), ...]
             = [0.909, -0.416, 0.020, 0.9998, ...]
 ```
 
-### RoPE: standar modern
+### RoPE (Rotary Positional Embedding): Standar Modern
 
-Model modern (Llama, Mistral, Qwen, Gemma) menggunakan **Rotary Positional Embedding (RoPE)** — pendekatan yang lebih elegan: alih-alih menambahkan vektor posisi ke embedding, RoPE *merotasi* vektor Query dan Key berdasarkan posisinya sebelum dot product dihitung. Efeknya adalah dot product Q·K secara otomatis mengandung informasi jarak relatif antara dua token.
+Model modern (Llama, Mistral, Qwen, Gemma, DeepSeek) menggunakan **Rotary Positional Embedding (RoPE)** — pendekatan yang jauh lebih elegan dibandingkan positional encoding sinusoidal tradisional:
 
-Keunggulan RoPE: performa lebih baik untuk context window panjang, dan lebih mudah di-extend. Beberapa model 2025–2026 menggunakan variasi RoPE (YaRN, NTK-aware scaling) untuk mendukung context window hingga 128K–1M token.
+- Alih-alih *menambahkan* vektor posisi ke embedding, RoPE **merotasikan** vektor Query dan Key di ruang 2D untuk setiap pasangan dimensi berdasarkan posisinya.
+- Efek dari rotasi ini adalah ketika Query dan Key di-dot product, relasi posisi absolut akan hilang dan secara geometris digantikan oleh **jarak relatif** antar-token.
+
+#### Intuisi Geometris RoPE (2D disederhanakan)
+
+Bayangkan sepasang dimensi embedding sebagai titik di bidang 2D. 
+- Token di posisi $m$ memiliki Query yang diputar sejauh $m\theta$ derajat.
+- Token di posisi $n$ memiliki Key yang diputar sejauh $n\theta$ derajat.
+- Ketika dot product dihitung:
+  $$\mathbf{q}_m^T \mathbf{k}_n = \text{rotasi}(\mathbf{q}, m\theta)^T \text{rotasi}(\mathbf{k}, n\theta) = \mathbf{q}^T \text{rotasi}(\mathbf{k}, (n-m)\theta)$$
+- Hasil dot product sekarang secara otomatis berekspresi sebagai fungsi dari **$n-m$** (selisih posisi relatif!).
+
+#### Mengapa RoPE Sangat Unggul?
+1. **Decay Jarak**: Secara alami, bobot perhatian antara token yang sangat jauh akan menurun seiring bertambahnya jarak, merefleksikan sifat alami bahasa di mana kata terdekat biasanya lebih relevan.
+2. **Fleksibilitas Konteks**: RoPE tidak membatasi model pada panjang maksimum tertentu saat pre-training.
+
+#### YaRN (Yet Another RoPE eNhancement)
+Untuk memperluas context window (misalnya dari 4K token ke 128K+ token) tanpa *retraining* dari awal, kita tidak bisa langsung meng-extrapolasi posisi baru karena model akan bingung dengan sudut rotasi yang terlalu besar. **YaRN** menyelesaikan ini dengan membagi dimensi frekuensi rotasi menjadi tiga zona:
+- **Low-frequency**: Sudut kecil (untuk relasi global), tidak diubah.
+- **Medium-frequency**: Di-interpolasi dengan halus agar transisi tidak merusak representasi.
+- **High-frequency**: Sudut besar (untuk relasi lokal), di-extrapolasi penuh untuk menjaga detail.
+
+YaRN dikombinasikan dengan scaling factor temperatur pada softmax logits agar distribusi perhatian tidak menjadi terlalu rata (flattened) akibat peningkatan jumlah token.
+
+#### Update 2026: Compressed Sparse Attention
+Pada model dengan context window jutaan token (seperti Gemini 3.5 Pro atau DeepSeek-V4), menghitung attention full $\mathcal{O}(n^2)$ menjadi mustahil. Industri menggunakan **Compressed Sparse Attention**:
+- Menggabungkan RoPE dengan kompresi sequence (misalnya, merangkum blok token yang jauh menjadi representasi latent).
+- Pola attention dibuat *sparse*: model memperhatikan token lokal secara detail (resolusi tinggi dengan RoPE asli) dan token global secara ringkas (resolusi rendah/terkompresi).
 
 ---
 
@@ -373,31 +400,64 @@ Block ini **diulang N kali**: BERT-base = 12 block, GPT-3 = 96 block, Llama 4 Sc
 Tanpa residual connection, sinyal dari layer awal "hilang" setelah melewati banyak transformasi — inilah *vanishing gradient*. Residual connection menambahkan input langsung ke output setiap sub-layer:
 
 ```
-output = LayerNorm(x + sub_layer(x))
+output = x + sub_layer(x)
 ```
 
 Ini menciptakan "jalan pintas" untuk gradients mengalir langsung dari output ke input selama backpropagation, tanpa harus melewati semua transformasi. Tanpa ini, melatih model dengan 12+ layer hampir mustahil.
 
-### Mengapa ada FFN setelah Attention?
+#### Pre-LN vs Post-LN: Evolusi Stabilitas Training
 
-Dua peran yang berbeda:
+Di mana kita meletakkan Layer Normalization (LayerNorm) sangat berpengaruh terhadap kemudahan melatih model:
 
-- **Multi-Head Attention** = operasi "komunikasi" antar token. Setiap token mengumpulkan informasi dari token lain.
-- **FFN** = operasi "komputasi" internal per token. Setiap token memproses informasi yang sudah terkumpul secara independen.
+```
+Post-LN (Transformer Asli 2017):
+  x ──→ Attention ──→ Add(x) ──→ LayerNorm ──→ FFN ──→ Add ──→ LayerNorm ──→ Output
 
-Tanpa FFN, model hanya bisa menggabungkan informasi antar token tanpa bisa mengolahnya lebih lanjut. Penelitian menunjukkan FFN bertindak seperti "memori" yang menyimpan pengetahuan faktual dari training data.
+Pre-LN (Standar Modern sejak GPT-2):
+  x ──→ LayerNorm ──→ Attention ──→ Add(x) ──→ LayerNorm ──→ FFN ──→ Add ──→ Output
+```
 
-Dimensi FFN (`d_ff`) biasanya 4× `d_model`: BERT-base punya `d_ff` = 3072 untuk `d_model` = 768.
+- **Post-LN**: Normalisasi diletakkan setelah residual addition. Masalahnya, variansi aktivasi di layer-layer akhir cenderung membesar, menyebabkan gradien di dekat layer awal menjadi sangat kecil (vanishing gradient). Training memerlukan pemanasan learning rate (warm-up) yang sangat presisi agar tidak divergen.
+- **Pre-LN**: Normalisasi diletakkan langsung pada input sebelum sub-layer (Attention/FFN) dan menjaga skala residual stream agar selalu stabil. Pre-LN memungkinkan kita melatih model yang sangat dalam (96+ block) dengan jauh lebih stabil tanpa trik warm-up yang berlebihan.
+
+#### RMSNorm: Kecepatan Komputasi Lebih Tinggi
+
+Model modern (seperti Llama dan DeepSeek) mengganti LayerNorm dengan **RMSNorm (Root Mean Square Normalization)**.
+- **LayerNorm Standard**: Menghitung mean $\mu$ dan variance $\sigma^2$ untuk menormalisasi input, lalu menerapkan scale $\gamma$ dan shift $\beta$.
+- **RMSNorm**: Mengasumsikan bahwa pergeseran rata-rata (mean shift) tidak krusial untuk stabilitas neural network. RMSNorm hanya membagi input dengan Root Mean Square (RMS) tanpa menghitung mean.
+  $$\text{RMS}(x) = \sqrt{\frac{1}{d} \sum_{i=1}^d x_i^2}$$
+  $$\text{RMSNorm}(x) = \frac{x}{\text{RMS}(x)} \odot \gamma$$
+- **Keuntungan**: Mengurangi beban komputasi di GPU sebanyak ~7% hingga 10% per block karena tidak perlu menghitung rata-rata dan variansi secara terpisah.
 
 ---
 
-## 💻 Kode: Visualisasi Attention Weights
+### Mengapa ada FFN setelah Attention?
+
+Dua peran yang berbeda dalam arsitektur Transformer block:
+- **Multi-Head Attention** = operasi **komunikasi** antar token. Setiap token mengumpulkan informasi dari token lain di sekitarnya.
+- **FFN (Feed-Forward Network)** = operasi **komputasi** internal per token. Setelah informasi terkumpul, setiap token memproses dan mematangkan informasi tersebut secara independen (paralel).
+
+Penelitian interpretabilitas menunjukkan bahwa FFN bertindak seperti "key-value memory" yang menyimpan pengetahuan faktual dari training data (misal: "Einstein" berasosiasi dengan "Jerman", "fisika", dll.).
+
+#### SwiGLU: Aktivasi Gated Modern
+Untuk meningkatkan kapasitas FFN tanpa memperlambat inferensi secara drastis, model modern mengganti ReLU/GELU dengan **SwiGLU**:
+
+- **FFN Klasik (ReLU/GELU)**:
+  $$\text{FFN}(x) = \text{Activation}(x W_1 + b_1) W_2 + b_2$$
+- **SwiGLU FFN**: Menggabungkan fungsi aktivasi **Swish** ($x \cdot \sigma(\beta x)$) dengan **Gated Linear Unit (GLU)**. FFN dipecah menjadi dua proyeksi paralel yang dikalikan secara element-wise:
+  $$\text{SwiGLU}(x) = \left( \text{Swish}(x W_{\text{gate}}) \odot x W_{\text{up}} \right) W_{\text{down}}$$
+- **Mengapa SwiGLU?** Gating mechanism ($\odot x W_{\text{up}}$) memungkinkan model secara dinamis menyaring informasi mana yang perlu diteruskan ke proyeksi berikutnya. Aktivasi Swish yang mulus (smooth) di sekitar nol menghindari masalah "dead neuron" yang sering terjadi pada ReLU.
+- **Trade-off**: SwiGLU membutuhkan 3 matriks proyeksi ($W_{\text{gate}}, W_{\text{up}}, W_{\text{down}}$) alih-alih 2 pada FFN standar. Hal ini meningkatkan jumlah parameter FFN sebesar ~50%, namun kompensasi peningkatan performanya sangat signifikan.
+
+---
+
+## 💻 Kode: Visualisasi Attention Weights (Google Colab Friendly)
+
+Di bawah ini adalah kode lengkap untuk memvisualisasikan satu attention head. Kamu bisa menyalinnya langsung ke Google Colab.
 
 ```python
-from transformers import AutoTokenizer, AutoModel
 import torch
-import matplotlib
-matplotlib.use('Agg')
+from transformers import AutoTokenizer, AutoModel
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -418,12 +478,8 @@ with torch.no_grad():
 # Setiap tensor: shape [batch_size, n_heads, seq_len, seq_len]
 attentions = outputs.attentions
 
-print(f"Jumlah layer: {len(attentions)}")          # 12 untuk BERT-base
-print(f"Shape per layer: {attentions[0].shape}")   # [1, 12, 11, 11]
-print(f"Tokens: {tokens}")
-
 # Ambil layer terakhir (representasi paling abstrak/semantik)
-# Head 0 sebagai contoh — coba ganti indeks head untuk eksplorasi
+# Head 0 sebagai contoh
 last_layer_attn = attentions[-1][0]  # shape: [12, seq_len, seq_len]
 head_idx = 0
 head_attn = last_layer_attn[head_idx].numpy()  # shape: [seq_len, seq_len]
@@ -443,37 +499,101 @@ plt.title(f"Attention Weights — Layer 12, Head {head_idx}")
 plt.xlabel("Key (token yang diperhatikan)")
 plt.ylabel("Query (token yang memperhatikan)")
 plt.tight_layout()
-plt.savefig("attention_heatmap.png", dpi=150)
-print("Gambar disimpan: attention_heatmap.png")
+plt.show()
 ```
 
-**Yang perlu kamu amati setelah menjalankan kode:**
+---
 
-1. Cari baris untuk token `"it"` pada heatmap. Token mana yang mendapat warna paling gelap (attention weight tertinggi)?
-2. Apakah itu `"cat"`? Jika iya, head ini berhasil menangkap relasi koreference.
-3. Ganti `head_idx` dari 0 ke 1, 2, ..., 11. Apakah setiap head menunjukkan pola berbeda?
-4. Coba perhatikan diagonal (setiap token memperhatikan dirinya sendiri) — apakah selalu dominan?
+### 🔬 Eksperimen Google Colab: Visualisasi Attention Zoo (12 Heads)
 
-> **Ekspektasi realistis**: Tidak semua head akan menunjukkan pola yang mudah diinterpretasi. Beberapa head menunjukkan pola yang tampak acak atau mendominasi pada token `[CLS]` dan `[SEP]`. Ini normal — interpretabilitas attention masih area riset aktif.
+Copy-paste kode ini ke Google Colab dengan runtime CPU untuk memvisualisasikan seluruh 12 attention head sekaligus dan menganalisis peran masing-masing head secara otomatis:
+
+```python
+# ============================================================
+# EKSPERIMEN: Attention Pattern Zoo — Semua 12 Head Layer Terakhir
+# ============================================================
+
+!pip install -q transformers seaborn matplotlib
+
+from transformers import AutoTokenizer, AutoModel
+import torch
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased", output_attentions=True)
+model.eval()
+
+# Kalimat yang kaya relasi linguistik
+kalimat = "The cat chased the mouse because it was hungry and wanted food"
+
+inputs = tokenizer(kalimat, return_tensors="pt")
+tokens = tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+
+with torch.no_grad():
+    outputs = model(**inputs)
+
+# Layer terakhir, semua 12 heads
+last_layer = outputs.attentions[-1][0]  # [12, seq_len, seq_len]
+
+fig, axes = plt.subplots(3, 4, figsize=(24, 16))
+fig.suptitle(f'BERT Layer 12 — 12 Attention Heads\n"{kalimat}"', fontsize=14, fontweight='bold')
+
+for head_idx in range(12):
+    ax = axes[head_idx // 4, head_idx % 4]
+    attn = last_layer[head_idx].numpy()
+    
+    # Analisis pola sederhana
+    diag_strength = np.mean(np.diag(attn[1:-1, 1:-1]))
+    
+    it_idx = tokens.index("it") if "it" in tokens else -1
+    cat_idx = tokens.index("cat") if "cat" in tokens else -1
+    coref_score = attn[it_idx, cat_idx] if it_idx > 0 and cat_idx > 0 else 0
+    
+    sns.heatmap(attn, xticklabels=tokens, yticklabels=tokens,
+                cmap='viridis', ax=ax, cbar=False, 
+                annot=False, square=True)
+    
+    pattern = ""
+    if diag_strength > 0.3: pattern = "📍 Diagonal (self-attention)"
+    elif coref_score > 0.15: pattern = "🔗 Coreference!"
+    else: pattern = "🔀 Other"
+    
+    ax.set_title(f'Head {head_idx} | {pattern}', fontsize=10)
+    ax.tick_params(axis='both', labelsize=8)
+
+plt.tight_layout()
+plt.show()
+
+# Analisis khusus: ke mana "it" memperhatikan?
+if "it" in tokens and "cat" in tokens:
+    it_idx = tokens.index("it")
+    cat_idx = tokens.index("cat")
+    print("\n🔍 Analisis Koreference (layer terakhir):")
+    print("-" * 60)
+    for head_idx in range(12):
+        attn = last_layer[head_idx].numpy()
+        top_targets = np.argsort(attn[it_idx])[::-1][:3]
+        targets = [(tokens[i], f"{attn[it_idx, i]:.3f}") for i in top_targets]
+        coref = "🔗" if cat_idx in top_targets else "  "
+        print(f"  Head {head_idx:>2d}: {coref} → {targets}")
+```
 
 ---
 
 ## ⚠️ Jebakan Umum
 
 ### Jebakan 1 — "Attention weight tinggi = model 'mengerti' relasi tersebut"
-
 Tidak sesederhana itu. Penelitian tentang *attention interpretability* masih aktif diperdebatkan. Attention weights tinggi menunjukkan *korelasi*, bukan kausalitas. Model bisa mencapai jawaban benar dengan pola attention yang terlihat "salah" secara linguistik — dan sebaliknya, pola attention yang "masuk akal" belum tentu yang benar-benar mendorong prediksi.
 
 ### Jebakan 2 — "Context window = memori model"
-
 Transformer tidak punya "memori" dalam arti tradisional. Ia memproses seluruh context window *sekaligus* setiap kali ada input baru — tidak ada rekam jejak dari percakapan sebelumnya kecuali dimasukkan eksplisit ke dalam context. Ini berbeda dari memori manusia yang bersifat episodik dan persisten.
 
 ### Jebakan 3 — "Lebih banyak layer = selalu lebih baik"
-
 Ada trade-off. Layer awal cenderung menangkap fitur lokal dan sintaktis (struktur frasa), layer tengah menangkap relasi semantik, layer akhir paling task-specific. Tapi menambah layer tanpa menambah data training dan regularisasi yang proporsional akan menghasilkan overfitting — model menghafal data training, bukan belajar generalisasi.
 
 ### Jebakan 4 — "Self-Attention = O(n²) selalu jadi bottleneck"
-
 Kompleksitas komputasi Self-Attention memang O(n²) terhadap panjang sequence — untuk 1000 token, ada 1.000.000 pasangan yang dihitung. Tapi dalam praktik modern, bottleneck sering ada di tempat lain (FFN, memory bandwidth). Ada juga varian efficient attention (FlashAttention, Sparse Attention, Linear Attention) yang mengurangi kompleksitas ini untuk sequence sangat panjang.
 
 ---
@@ -481,25 +601,18 @@ Kompleksitas komputasi Self-Attention memang O(n²) terhadap panjang sequence �
 ## 🧩 Latihan
 
 ### Level 1 — Recall
-
-Gambar diagram di kertas yang menunjukkan flow satu token melalui satu Transformer block:
-embedding → (+positional encoding) → Multi-Head Attention → residual → LayerNorm → FFN → residual → LayerNorm → output.
+Gambar diagram di kertas yang menunjukkan flow satu token melalui satu Transformer block (Pre-LN):
+embedding → LayerNorm → MHA → residual → LayerNorm → FFN → residual → output.
 
 Tandai di mana Q, K, V terbentuk, dan di mana hasil attention digabungkan.
 
 ### Level 2 — Aplikasi
-
-Modifikasi kode di atas untuk memvisualisasikan **semua 12 head sekaligus** dalam satu figure (gunakan `plt.subplot`). Perhatikan:
-- Head mana yang paling memperhatikan token `"it"` ke `"cat"`?
-- Head mana yang paling memperhatikan token ke dirinya sendiri (diagonal)?
-- Head mana yang polanya paling "acak" atau sulit diinterpretasi?
+Jalankan eksperimen Colab di atas. Identifikasi:
+- Head mana saja yang memiliki pola diagonal (memperhatikan dirinya sendiri atau token persis di sebelahnya)?
+- Head mana saja yang berhasil menangkap relasi coreference (menghubungkan pronoun `"it"` ke noun `"cat"` atau `"mouse"`)?
 
 ### Level 3 — Eksplorasi
-
-Cari dan baca ringkasan paper **"Are Sixteen Heads Really Better than One?"** (Michel et al., 2019). Pertanyaan panduan:
-- Apa yang terjadi jika sebagian besar attention head di-prune (dihilangkan) saat inference?
-- Head mana yang paling "penting" dan head mana yang redundan?
-- Apa implikasinya untuk efisiensi model dan asumsi kita tentang Multi-Head Attention?
+Cari tahu tentang **Pre-LN vs Post-LN**. Mengapa model GPT-2 ke atas hampir semuanya bermigrasi ke Pre-LN? Apa hubungannya dengan kemudahan gradien mengalir selama backpropagation di model berukuran raksasa?
 
 ---
 
@@ -513,12 +626,5 @@ Cari dan baca ringkasan paper **"Are Sixteen Heads Really Better than One?"** (M
 | **V (Value)** | Proyeksi "informasi sesungguhnya" yang akan dibagikan jika Key-nya relevan dengan Query |
 | **Softmax(QKᵀ/√d_k)** | Menghasilkan attention weights — distribusi probabilitas seberapa besar perhatian ke setiap token |
 | **Multi-Head Attention** | Beberapa attention head paralel; masing-masing menangkap jenis relasi berbeda secara otomatis |
-| **Positional Encoding** | Ditambahkan ke embedding agar model tahu urutan token — tanpanya, anagram dan kalimat normal terlihat identik |
-| **Residual + LayerNorm** | Memungkinkan training model sangat dalam tanpa vanishing gradient |
-| **FFN** | Komputasi internal per token setelah attention; sering dianggap sebagai "memori" faktual model |
-
-> **Takeaway utama**: Transformer memungkinkan setiap token langsung "berkomunikasi" dengan semua token lain dalam satu operasi paralel — tanpa urutan, tanpa jarak. Q-K-V adalah mekanisme untuk mengukur relevansi dan mengambil informasi yang relevan tersebut. Inilah kenapa Transformer jauh lebih powerful dan efisien dari RNN untuk teks.
-
----
 
 **Selanjutnya → Modul 2.2: Arsitektur Modern** — Transformer standar sudah berumur hampir 9 tahun. Industri sudah jauh berkembang: Flash Attention, Mixture of Experts, GQA, SwiGLU, dan banyak lagi.

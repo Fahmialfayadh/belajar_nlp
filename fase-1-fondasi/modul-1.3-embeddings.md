@@ -87,6 +87,90 @@ Untuk produksi (RAG, pencarian semantik), **selalu gunakan model yang didesain k
 
 ---
 
+### 📖 Deep-Dive: Bagaimana Embedding Model Dilatih? (Contrastive Learning)
+
+Modul sebelumnya menyebut "contrastive learning" tanpa menjelaskan. Mari kita bongkar, karena ini fundamental untuk memahami *mengapa* beberapa embedding model lebih baik dari yang lain.
+
+**Masalah**: Bagaimana melatih model agar kalimat yang *mirip maknanya* punya embedding yang berdekatan, dan yang *berbeda maknanya* punya embedding yang berjauhan?
+
+**Jawaban: Contrastive Learning** — latih model dengan "contoh kontras":
+
+```
+Training sample:
+  Anchor:    "Kucing tidur di sofa"
+  Positive:  "Ada kucing berbaring di kursi"      → tarik mendekat ✓
+  Negative:  "Mobil melaju kencang di jalan"       → dorong menjauh ✗
+  
+Loss function (InfoNCE):
+  → Minimize distance(anchor, positive)
+  → Maximize distance(anchor, negative)
+  → Dilakukan atas semua sample dalam satu batch
+```
+
+**Kenapa "hard negatives" penting?**
+
+Negative yang terlalu mudah ("mobil" vs "kucing") tidak memberi banyak sinyal belajar — model sudah tahu mereka berbeda. Yang lebih berguna adalah **hard negatives** — contoh yang *hampir mirip* tapi sebenarnya berbeda:
+
+```
+Anchor:       "Cara mengajukan visa kerja Australia"
+Easy negative: "Resep rendang"                        (terlalu beda, tidak informatif)
+Hard negative: "Syarat mengajukan visa turis Australia" (mirip tapi BEDA intent!)
+```
+
+Model yang dilatih dengan hard negatives menghasilkan embedding yang jauh lebih tajam dan presisi.
+
+#### Evolusi Teknik Training Embedding (2026)
+
+| Teknik | Era | Cara Kerja |
+|--------|-----|-----------|
+| Contrastive (SBERT) | 2019 | Anchor + positive + negative, triplet loss |
+| Hard Negative Mining | 2021+ | Cari negative yang paling "membingungkan" untuk model |
+| Instruction-Tuned | 2024+ | Tambahkan instruksi di depan query: "retrieve a document answering..." |
+| Distillation dari Reranker | 2025+ | Cross-encoder reranker (lebih akurat) mengajarkan embedding model |
+| zELO | 2026 | Relevansi dimodelkan sebagai Elo rating (seperti ranking catur), bukan biner |
+
+**Instruction-Tuned Embeddings** layak penjelasan lebih:
+
+Model embedding terbaru (Qwen3-Embedding, NV-Embed-v2) dilatih dengan *task instructions* di depan query:
+
+```
+# Tanpa instruction (model lama):
+embed("cara merawat kucing")
+
+# Dengan instruction (model baru):
+embed("Given a question, retrieve a relevant document: cara merawat kucing")
+```
+
+Instruksi memberi "petunjuk" ke model tentang *jenis* kesamaan apa yang harus dicari — semantic similarity, exact match, topical relevance, dll. Ini meningkatkan performa secara signifikan.
+
+---
+
+### 📖 Update 2026: Matryoshka Embeddings — Potong Dimensi Tanpa Retrain
+
+Bayangkan kamu punya embedding 1024 dimensi yang disimpan di vector database untuk jutaan dokumen. Suatu hari, kamu perlu mempercepat search karena latensi terlalu tinggi. Harus retrain model? Harus re-embed semua dokumen?
+
+**Matryoshka Representation Learning (MRL)** mengatasi ini:
+
+- Model dilatih agar *dimensi awal* embedding sudah mengandung informasi terpenting
+- Kamu bisa **memotong** embedding dari 1024D ke 256D (atau bahkan 64D!) dan hasilnya masih bermakna
+- Seperti boneka Matryoshka Rusia — setiap "lapisan" mengandung informasi yang semakin detail
+
+```
+Embedding penuh (1024D): [0.23, 0.45, 0.12, ..., 0.89]  → akurasi 95%
+Dipotong ke 512D:        [0.23, 0.45, 0.12, ..., 0.67]  → akurasi 93%  (↓2%)
+Dipotong ke 256D:        [0.23, 0.45, 0.12, ..., 0.34]  → akurasi 90%  (↓5%)
+Dipotong ke 64D:         [0.23, 0.45, 0.12, ..., 0.11]  → akurasi 82%  (↓13%)
+```
+
+**Kegunaan praktis**:
+- **Hemat storage**: 256D vs 1024D = 4x lebih hemat di vector database
+- **Search lebih cepat**: dimensi lebih rendah = jarak dihitung lebih cepat
+- **Adaptive**: satu model, banyak "resolusi" embedding sesuai kebutuhan
+
+Model modern (Gemini Embedding v2, Qwen3-Embedding, NV-Embed-v2) sudah mendukung Matryoshka secara default — cek dokumentasi untuk dimensi minimum yang direkomendasikan.
+
+---
+
 ### 💻 Kode: Melihat Contextual Embeddings Bekerja
 
 ```python
@@ -153,6 +237,9 @@ BERT standar dilatih untuk *masked language modeling*, bukan untuk *sentence sim
 **Jebakan 3: "Embedding sekali jalan untuk semua input"**
 Di sistem RAG, kamu meng-embed dokumen *satu kali* dan menyimpannya di vector database. Tapi query pengguna harus di-embed *setiap kali*. Pastikan kamu menggunakan **model embedding yang sama** untuk dokumen dan query — mencampur model yang berbeda akan menghasilkan vektor yang tidak sebanding.
 
+**Jebakan 4: "Skor MTEB leaderboard = kualitas di domain saya"**
+MTEB mengukur performa *umum* pada benchmark standar. Di produksi RAG, performa sangat bergantung pada domain spesifikmu (hukum, medis, e-commerce). Selalu lakukan *evaluasi sendiri* pada data yang representatif sebelum memilih model embedding.
+
 ---
 
 ### 🧩 Latihan
@@ -168,6 +255,73 @@ Cari tahu tentang **"embedding drift"** atau **"domain shift"** dalam embedding.
 
 ---
 
+### 🔬 Eksperimen Google Colab: Matryoshka Embeddings — Potong Dimensi, Ukur Dampaknya!
+
+```python
+# ============================================================
+# EKSPERIMEN: Matryoshka Embeddings — Seberapa Banyak Dimensi yang Bisa Dipotong?
+# ============================================================
+# Lihat seberapa banyak dimensi yang bisa dipotong sebelum retrieval rusak
+
+!pip install -q sentence-transformers
+
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# Simulasi RAG corpus
+corpus = [
+    "Python adalah bahasa pemrograman yang populer untuk data science.",
+    "Machine learning menggunakan data untuk melatih model prediktif.",
+    "Resep nasi goreng: goreng nasi dengan bumbu dan sayuran.",
+    "Kucing adalah hewan peliharaan yang mandiri dan suka tidur.",
+    "Transformer adalah arsitektur neural network untuk NLP.",
+    "Jakarta adalah ibukota Indonesia dengan populasi terbesar.",
+    "Deep learning adalah subset dari machine learning yang menggunakan neural network.",
+    "Bali terkenal dengan pantai dan budayanya yang kaya.",
+    "Fine-tuning LLM membutuhkan GPU dengan VRAM yang besar.",
+    "Rendang adalah masakan Minang yang terkenal di seluruh dunia.",
+]
+
+query = "cara melatih model AI"
+
+query_emb = model.encode(query)
+corpus_embs = model.encode(corpus)
+full_dim = query_emb.shape[0]
+
+# Test berbagai level truncation (Matryoshka-style)
+dims_to_test = [full_dim, 256, 128, 64, 32, 16, 8]
+full_top1 = np.argmax(corpus_embs @ query_emb / 
+                      (np.linalg.norm(corpus_embs, axis=1) * np.linalg.norm(query_emb)))
+
+print(f"Full embedding dimension: {full_dim}")
+print(f"Query: '{query}'")
+print("=" * 80)
+
+for dim in dims_to_test:
+    q = query_emb[:dim]
+    c = corpus_embs[:, :dim]
+    
+    q_norm = q / np.linalg.norm(q)
+    c_norm = c / np.linalg.norm(c, axis=1, keepdims=True)
+    scores = c_norm @ q_norm
+    top_3_idx = np.argsort(scores)[::-1][:3]
+    
+    match = "✅" if full_top1 == top_3_idx[0] else "❌ DRIFT!"
+    print(f"\n📐 Dimensi: {dim} (kompresi {(1 - dim/full_dim)*100:.0f}%) | Top-1 match: {match}")
+    for rank, idx in enumerate(top_3_idx):
+        print(f"   [{rank+1}] Score={scores[idx]:.4f} | {corpus[idx][:60]}...")
+
+print("\n💡 INSIGHT: Perhatikan sampai dimensi berapa top-1 result masih sama.")
+print("   Dimensi yang bisa 'dipotong' tanpa mengubah hasil = dimensi 'redundan'.")
+print("   Ini prinsip di balik Matryoshka Embeddings!")
+```
+
+> **Yang perlu kamu amati**: Pada dimensi berapa top-1 result mulai berubah? Itu adalah "batas aman" truncation. Model yang dilatih dengan Matryoshka objective memiliki batas ini jauh lebih rendah dari model biasa.
+
+---
+
 ### 📝 Rangkuman
 
 | Konsep | Inti Pemahaman |
@@ -175,8 +329,12 @@ Cari tahu tentang **"embedding drift"** atau **"domain shift"** dalam embedding.
 | Static Embedding | Satu kata = satu vektor tetap; tidak bisa menangani ambiguitas |
 | Contextual Embedding | Vektor berubah sesuai konteks; dihasilkan oleh Transformer |
 | Sentence Embedding | Satu kalimat = satu vektor; gunakan SBERT atau model khusus, bukan BERT biasa |
+| Contrastive Learning | Latih model dengan contoh mirip (positive) dan berbeda (negative) |
+| Hard Negatives | Contoh negatif yang "hampir mirip" — kunci embedding yang presisi |
+| Matryoshka (MRL) | Potong dimensi embedding tanpa retrain; dimensi awal = informasi terpenting |
+| Instruction-Tuned | Embedding yang menerima instruksi task untuk presisi lebih tinggi |
 | Domain Spesifik | Embedding terbaik adalah yang dilatih pada domain yang sama dengan use case |
 
-> **Takeaway utama**: Embedding adalah "representasi pikiran" model tentang sebuah teks — dan kualitasnya bergantung pada konteks pelatihan. Pilih embedding model yang tepat untuk domainmu.
+> **Takeaway utama**: Embedding adalah "representasi pikiran" model tentang sebuah teks — dan kualitasnya bergantung pada teknik training (contrastive learning, hard negatives) dan kesesuaian domain. Pilih embedding model yang tepat, dan ketahui cara mengukur kualitasnya.
 
 **Selanjutnya → Fase 2: Transformer** — Sekarang kita sudah punya token dan embedding. Saatnya memahami *mesin* yang mengolahnya.

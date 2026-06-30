@@ -48,6 +48,29 @@ Ini adalah struktur hierarkis HNSW: **graph multi-layer** di mana layer atas ada
 
 Kompleksitas: **O(log n)** — jauh lebih baik dari O(n) brute force.
 
+#### Deep-Dive: Parameter Tuning HNSW
+Saat mengonfigurasi HNSW di Vector DB (seperti Qdrant atau Milvus), kamu akan menemui tiga parameter kritis ini yang menentukan trade-off akurasi (recall) vs kecepatan/memori:
+
+1. **$M$**: Jumlah maksimum link koneksi per node di setiap layer graph.
+   - Range umum: 4 hingga 64 (default biasanya 16).
+   - *Impact*: $M$ lebih besar = pencarian graph lebih akurat untuk ruang dimensi tinggi, namun pemakaian memori RAM membesar drastis dan pembuatan index lebih lambat.
+2. **$efConstruction$**: Jumlah entry point terdekat yang diperiksa selama proses pembuatan index graph.
+   - *Impact*: Semakin besar nilai $efConstruction$, kualitas graph bertambah bagus (pencarian di masa depan lebih akurat), tetapi waktu untuk melakukan indexing dokumen baru (ingestion time) melonjak.
+3. **$efSearch$**: Jumlah entry point terdekat yang diperiksa selama proses pencarian (search time).
+   - *Impact*: Parameter dinamis yang bisa diatur saat query. Nilai $efSearch$ tinggi meningkatkan akurasi retrieval, namun meningkatkan latency pencarian.
+
+#### IVF-PQ: Alternatif untuk Dataset Sangat Raksasa
+HNSW sangat cepat, tetapi memiliki kelemahan: **mengkonsumsi RAM sangat besar** karena seluruh graph disimpan di memori. Jika kamu memiliki 100 juta+ dokumen, HNSW bisa membutuhkan RAM ratusan GB.
+Sebagai alternatif, kita bisa menggunakan **IVF-PQ (Inverted File Index with Product Quantization)**:
+- **IVF (Inverted File)**: Mengelompokkan seluruh vektor ke dalam beberapa cluster (menggunakan K-Means). Saat query masuk, sistem hanya mencari di cluster terdekat (mempersempit ruang pencarian).
+- **PQ (Product Quantization)**: Mengompresi representasi vektor dengan membaginya menjadi sub-vektor, lalu menyimpannya dalam bentuk codebook berdimensi rendah.
+*Trade-off*: IVF-PQ jauh lebih hemat memori dibandingkan HNSW (bisa mengompresi RAM hingga 90%), namun waktu pencarian (latency) lebih lambat dan akurasinya sedikit di bawah HNSW.
+
+#### Quantization Trade-offs (Scalar vs Binary)
+Untuk mengurangi konsumsi memori HNSW tanpa berpindah ke IVF-PQ, vector database modern (seperti Qdrant) mendukung teknik kompresi tingkat lanjut:
+- **SQ (Scalar Quantization)**: Mengubah presisi float32 (4 byte per angka) menjadi int8 (1 byte per angka). Menghemat RAM $\approx 4\times$ dengan penurunan akurasi minimal (< 1%).
+- **BQ (Binary Quantization)**: Mengubah setiap angka float menjadi 1 bit (0 jika negatif, 1 jika positif). Mengompresi memori hingga **32x** dan meningkatkan kecepatan search hingga 10x! Sangat cocok untuk model embedding yang dilatih secara khusus untuk binary search (seperti Cohere Embed v4).
+
 ---
 
 ### 📖 Memilih Vector Database
@@ -152,15 +175,32 @@ Selalu simpan teks asli (atau setidaknya ID referensi ke sumber) sebagai payload
 
 ---
 
+### 🧩 Latihan
+
+**Level 1 — Recall:**
+Jelaskan perbedaan trade-off antara HNSW dan IVF-PQ dalam hal penggunaan memori RAM, kecepatan pencarian (latency), dan akurasi (recall).
+
+**Level 2 — Aplikasi:**
+Jelaskan peran parameter `$M$`, `$efConstruction$`, dan `$efSearch$` pada algoritma HNSW. Jika kamu ingin mengoptimasi pencarian pada sistem produksi yang melayani traffic query yang sangat padat tanpa memedulikan waktu indexing, kombinasi parameter mana yang akan kamu ubah (perbesar/perkecil)?
+
+**Level 3 — Eksplorasi:**
+Apa yang dimaksud dengan **Binary Quantization (BQ)**? Bagaimana teknik ini dapat mengompresi ukuran memori database hingga $32\times$, dan model embedding jenis apa yang harus kamu gunakan jika ingin mengaktifkan fitur ini di Vector DB?
+
+---
+
 ### 📝 Rangkuman
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| ANN | Approximately nearest neighbor — cukup "hampir" terdekat, tapi 100x lebih cepat |
-| HNSW | Graph multi-layer; search O(log n); standar industri |
-| Vector DB | Dioptimasi untuk ANN + filter metadata; bukan pengganti RDBMS |
-| Pilihan DB | ChromaDB untuk dev; Qdrant/Milvus untuk produksi; Pinecone untuk managed |
+| **ANN** | Approximately nearest neighbor — pencarian tetangga terdekat secara estimasi, 100x-1000x lebih cepat daripada brute force. |
+| **HNSW** | Index berbasis graph multi-layer hierarkis dengan kompleksitas pencarian $\mathcal{O}(\log n)$; standar emas Vector DB. |
+| **HNSW Tuning** | `$M$` dan `$efConstruction$` mengatur akurasi graph saat build; `$efSearch$` mengatur akurasi vs latency saat search. |
+| **IVF-PQ** | Alternatif index hemat memori dengan clustering (IVF) dan product quantization (PQ), cocok untuk dataset skala raksasa (>100M). |
+| **Quantization** | SQ (Scalar Quantization) mengompresi RAM $\approx 4\times$ (float32 $\to$ int8); BQ (Binary Quantization) mengompresi RAM $\approx 32\times$. |
 
-> **Takeaway utama**: Vector database adalah "memory jangka panjang" dari sistem RAG. HNSW adalah algoritma di balik layar yang membuatnya cepat.
+> **Takeaway utama**: Vector database adalah "memori jangka panjang" sistem RAG. Pilih jenis index (HNSW vs IVF-PQ) dan level quantization (SQ vs BQ) secara cermat untuk menyeimbangkan performa RAM, akurasi, dan biaya infrastruktur.
+
+---
 
 **Selanjutnya → Modul 3.3: LoRA & QLoRA** — Bagaimana mengubah "kepribadian" model 70 miliar parameter dengan GPU yang kamu punya.
+

@@ -125,6 +125,42 @@ Model reranker populer (2025-2026): `BAAI/bge-reranker-v2-m3` (akurat, multiling
 
 ---
 
+### 📖 Strategi Retrieval Lanjutan (Advanced Retrieval)
+
+Untuk skenario produksi yang kompleks, hybrid search dan rerank dasar sering kali tidak cukup. Berikut adalah pola retrieval lanjutan yang digunakan pada sistem state-of-the-art di 2026:
+
+#### 1. Query Decomposition (Sub-Query Querying)
+Seringkali pengguna menanyakan pertanyaan multi-hop yang menggabungkan beberapa topik. Misalnya: *"Apakah kebijakan cuti melahirkan di Perusahaan A lebih lama dibandingkan Perusahaan B?"*
+- **Masalah**: Single vector search langsung pada query ini akan gagal karena tidak ada dokumen tunggal yang membandingkan kedua perusahaan tersebut secara langsung.
+- **Solusi**: LLM digunakan di awal sebagai **Query Planner** untuk mendekomposisi (memecah) query utama menjadi beberapa sub-query:
+  1. *"Berapa lama cuti melahirkan di Perusahaan A?"*
+  2. *"Berapa lama cuti melahirkan di Perusahaan B?"*
+- Sistem RAG kemudian melakukan retrieval untuk masing-masing sub-query secara paralel, mengumpulkan hasilnya, dan membiarkan LLM utama melakukan sintesis perbandingan.
+
+#### 2. RAPTOR (Recursive Abstractive Processing for Tree-Organized Retrieval)
+Bagaimana jika pengguna menanyakan pertanyaan konseptual yang membutuhkan pemahaman seluruh isi dokumen? Misalnya: *"Rangkum tema utama laporan tahunan ini."*
+- **Masalah**: Chunking standar memotong teks menjadi fragmen-fragmen kecil. Retrieval hanya mengambil fragmen lokal, sehingga LLM kehilangan pandangan global (global context).
+- **Solusi (RAPTOR)**:
+  - Dokumen dipotong menjadi chunk kecil (daun/leaf nodes).
+  - Model melakukan clustering pada chunk-chunk tersebut berdasarkan kemiripan semantik.
+  - LLM merangkum (summarize) setiap cluster, menghasilkan node summary tingkat atas.
+  - Proses clustering dan perangkuman dilakukan secara rekursif hingga membentuk pohon hierarki (**Tree-Organized Retrieval**).
+  - Saat pencarian, sistem mencari kecocokan query baik pada level detail (daun) maupun level rangkuman (parent nodes).
+
+#### 3. Contextual Compression (Kondensasi Konteks)
+Reranker membantu memilih top-K chunk, tetapi chunk-chunk tersebut masih mengandung banyak noise/kalimat basa-basi yang membuang-buang token.
+- **Solusi**: Menggunakan model kompresor kecil untuk menyaring setiap retrieved chunk secara instan, membuang kalimat yang tidak relevan dengan query, dan hanya mengirimkan esensi informasi yang padat ke LLM.
+
+#### 4. Agentic RAG
+Pola paling interaktif di 2026 adalah **Agentic RAG**. Alih-alih retrieval satu kali jalan, proses pencarian dikendalikan oleh Agent dengan loop keputusan:
+1. Agent menerima query dan memanggil tool pencari.
+2. Agent membaca hasil pencarian awal (observation).
+3. Jika informasi kurang lengkap, agent merumuskan kata kunci baru dan memanggil tool pencarian lagi (looping).
+4. Jika menemukan informasi kontradiktif, agent memanggil tool verifikasi sumber data.
+5. Setelah yakin informasi cukup, agent menghasilkan jawaban akhir.
+
+---
+
 ### 💻 Kode: Implementasi RAG dengan Hybrid Search
 
 ```python
@@ -213,10 +249,80 @@ Embedding model yang bagus untuk *kemiripan semantik umum* belum tentu bagus unt
 Jelaskan skenario konkret di mana: (a) BM25 lebih baik dari vector search, dan (b) vector search lebih baik dari BM25. Apa implikasinya untuk hybrid search?
 
 **Level 2 — Aplikasi:**
-Tambahkan reranker ke pipeline di atas. Setelah hybrid search menghasilkan top-5, gunakan `cross-encoder/ms-marco-MiniLM-L-6-v2` untuk menilai ulang dan pilih top-3. Apakah urutan hasilnya berubah?
+Jalankan eksperimen Colab di bawah. Ubah nilai `alpha` dari `0.1` (dominan vector) menjadi `0.9` (dominan BM25) untuk query faktual. Amati apakah urutan dokumen yang paling tepat berubah.
 
 **Level 3 — Eksplorasi:**
-Riset tentang "RAPTOR" (Recursive Abstractive Processing for Tree-Organized Retrieval). Bagaimana ia mengatasi masalah informasi yang tersebar di banyak chunk? Kapan kamu akan menggunakannya vs. RAG standar?
+Jelaskan konsep **Query Decomposition**. Bagaimana teknik ini membantu menyelesaikan query bertingkat (multi-hop) seperti *"Apakah kecepatan unduh paket Internet Cepat 50 Mbps lebih cepat dari kecepatan unggah paket premium?"*
+
+---
+
+### 🔬 Eksperimen Google Colab: Mini RAG Pipeline (Hybrid + Reranking)
+
+Copy-paste kode ini ke Google Colab (CPU runtime) untuk menjalankan visualisasi pipeline RAG lengkap dengan Hybrid Search (BM25 + Vector) dan Reranking menggunakan Cross-Encoder secara instan:
+
+```python
+# ============================================================
+# EKSPERIMEN: RAG Pipeline — Hybrid Search + Reranking
+# ============================================================
+
+!pip install -q sentence-transformers rank-bm25 transformers
+
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
+import numpy as np
+
+# Corpus dokumen
+corpus = [
+    "Harga paket internet Cepat 10GB adalah Rp 50.000 per bulan.",
+    "Paket internet kami tersedia dalam berbagai pilihan kecepatan dan kuota fiber optic.",
+    "Cara mengaktifkan paket internet: ketik REG PAKET ke 1234.",
+    "Layanan pelanggan kami tersedia 24 jam sehari, 7 hari seminggu via telepon.",
+    "Kuota internet Cepat 10GB cocok untuk streaming video definisi standar.",
+    "Harga langganan premium unlimited adalah Rp 150.000 per bulan.",
+]
+
+print("📦 Loading models...")
+embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# Indexing BM25
+tokenized_docs = [doc.lower().split() for doc in corpus]
+bm25 = BM25Okapi(tokenized_docs)
+
+# Indexing Vector
+corpus_embs = embedder.encode(corpus)
+
+def search_pipeline(query, top_k_retrieval=4, top_k_final=2, alpha=0.5):
+    print(f"\n🔍 Query: '{query}'")
+    
+    # 1. BM25 Score
+    bm25_scores = np.array(bm25.get_scores(query.lower().split()))
+    bm25_norm = (bm25_scores - bm25_scores.min()) / (bm25_scores.max() - bm25_scores.min() + 1e-8)
+    
+    # 2. Vector Score
+    q_emb = embedder.encode(query)
+    vec_scores = corpus_embs @ q_emb / (np.linalg.norm(corpus_embs, axis=1) * np.linalg.norm(q_emb) + 1e-8)
+    
+    # 3. Hybrid
+    hybrid_scores = alpha * bm25_norm + (1 - alpha) * vec_scores
+    retrieved_idx = np.argsort(hybrid_scores)[::-1][:top_k_retrieval]
+    
+    print("\n📊 Hasil Hybrid Search:")
+    for idx in retrieved_idx:
+        print(f"   Score={hybrid_scores[idx]:.3f} | BM25={bm25_norm[idx]:.3f} | Vec={vec_scores[idx]:.3f} | {corpus[idx]}")
+        
+    # 4. Reranking
+    pairs = [[query, corpus[idx]] for idx in retrieved_idx]
+    rerank_scores = reranker.predict(pairs)
+    
+    reranked_idx = [retrieved_idx[i] for i in np.argsort(rerank_scores)[::-1]]
+    
+    print("\n🎯 Hasil Setelah Reranking (Cross-Encoder):")
+    for rank, idx in enumerate(reranked_idx[:top_k_final]):
+        print(f"   [{rank+1}] {corpus[idx]}")
+
+search_pipeline("berapa harga paket internet Cepat 10GB?", alpha=0.6)
+```
 
 ---
 
@@ -224,11 +330,15 @@ Riset tentang "RAPTOR" (Recursive Abstractive Processing for Tree-Organized Retr
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| RAG Naif | Mudah diimplementasikan tapi gagal di produksi karena retrieval tidak presisi |
-| Hybrid Search | BM25 untuk kata kunci, vector untuk semantik; gabungkan keduanya |
-| Semantic Chunking | Potong di batas topik/kalimat, bukan batas karakter; gunakan overlap |
-| Reranking | Cross-encoder untuk filter kedua; lebih akurat dari vector search murni |
+| **RAG Naif** | Mudah diimplementasikan tapi gagal di produksi karena retrieval tidak presisi (lost in the middle). |
+| **Hybrid Search** | BM25 untuk kata kunci/fakta, vector untuk semantik/konsep; gabungkan keduanya. |
+| **Semantic Chunking** | Potong dokumen berdasarkan batas kalimat atau perubahan topik secara semantik, bukan jumlah karakter statis. |
+| **Reranking** | Cross-Encoder untuk menyaring ulang kandidat chunk; sangat akurat karena membandingkan query dan dokumen bersamaan. |
+| **Advanced Retrieval** | Teknik seperti Query Decomposition, RAPTOR (Tree-Organized Retrieval), dan Agentic RAG untuk pencarian kompleks. |
 
-> **Takeaway utama**: Kualitas RAG ditentukan 80% oleh kualitas retrieval, bukan oleh kualitas LLM. Investasikan waktu di sini.
+> **Takeaway utama**: Kualitas RAG ditentukan 80% oleh kualitas retrieval, bukan oleh kualitas LLM. Reranking dan Hybrid Search adalah fondasi utama yang wajib ada di RAG produksi.
+
+---
 
 **Selanjutnya → Modul 3.2: Vector Database** — Di mana dan bagaimana menyimpan jutaan embedding secara efisien.
+

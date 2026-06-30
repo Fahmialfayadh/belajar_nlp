@@ -99,11 +99,42 @@ class MoERouter(nn.Module):
 - Performa mendekati model dense yang jauh lebih besar
 - Biaya komputasi per token jauh lebih rendah
 
-### Trade-off yang perlu kamu ketahui
+### Deep-Dive: Expert Collapse & Load Balancing
 
-- Performa tinggi saat inferensi (hanya sebagian parameter aktif)
-- Tapi training jauh lebih kompleks dan tidak stabil (router bisa "collapse" — semua token diarahkan ke 1-2 expert yang sama). DeepSeek memperkenalkan teknik *auxiliary-loss-free load balancing* untuk mengatasi ini.
-- Memori total tetap besar (semua parameter harus dimuat ke GPU/RAM meski tidak semuanya aktif)
+Membangun router MoE bukan sekadar membuat linear layer biasa. Masalah terbesar dalam melatih MoE adalah **Expert Collapse**:
+
+```
+Mula-mula: Router sedikit condong ke Expert A.
+  ↓
+Expert A menerima lebih banyak gradient update karena sering dipanggil.
+  ↓
+Expert A menjadi lebih pintar dibandingkan expert lain.
+  ↓
+Router semakin condong mengarahkan token ke Expert A.
+  ↓
+Expert collapse: Expert A terbebani penuh, expert lain menganggur (idle).
+```
+
+Jika ini terjadi, model MoE akan berperilaku seperti model *dense* kecil, menyia-nyiakan kapasitas dari parameter expert lainnya.
+
+#### Solusi Klasik: Auxiliary Loss
+Secara tradisional (seperti pada Mixtral), peneliti menambahkan fungsi loss tambahan (**auxiliary loss**) selama training. Loss ini menghukum router jika distribusinya tidak merata:
+- Menghitung frekuensi pemilihan setiap expert dalam satu batch.
+- Menghitung entropi dari probabilitas perutean.
+- Menambahkan penalty ke loss total jika router memilih expert yang sama secara berlebihan.
+*Trade-off*: Auxiliary loss yang terlalu besar dapat menurunkan performa model karena mengorbankan kualitas perutean demi keadilan (fairness).
+
+#### Update 2026: Auxiliary-Loss-Free Load Balancing (DeepSeek-V3/V4)
+DeepSeek memperkenalkan terobosan penting untuk melatih model skala triliunan parameter tanpa degradasi performa:
+- **Bias Dinamis**: Alih-alih menambahkan auxiliary loss ke fungsi optimasi utama, DeepSeek menggunakan bias dinamis pada logits router.
+- Jika sebuah expert terpilih melebihi kapasitas idealnya, bias pengurang ditambahkan pada logits expert tersebut untuk menurunkan probabilitas pemilihannya pada iterasi berikutnya.
+- Teknik ini menjaga beban expert tetap seimbang (load balancing) tanpa mengganggu representasi gradient model utama, sehingga performa tetap optimal.
+
+### Trade-off MoE yang Perlu Kamu Ketahui
+
+- **Kecepatan Inferensi Tinggi**: Hanya sebagian kecil parameter yang diaktivasi per token (misal: 2 dari 8 expert).
+- **RAM/VRAM Raksasa**: Meskipun parameter aktif kecil, **seluruh parameter expert harus tetap dimuat di memori (VRAM/RAM)**. Deployment model MoE triliunan parameter membutuhkan GPU cluster yang sangat besar.
+- **Komunikasi Latensi Tinggi**: Jika expert tersebar di beberapa GPU berbeda, terjadi overhead jaringan yang signifikan (all-to-all communication) untuk memindahkan representasi token ke GPU tempat expert tersebut berada.
 
 ---
 
@@ -144,77 +175,64 @@ Mendistribusikan attention computation ke banyak GPU secara efisien, memungkinka
 
 ### Multi-head Latent Attention (MLA)
 
-Diperkenalkan oleh DeepSeek-V2 (2024), MLA mengompresi Key dan Value ke dimensi yang jauh lebih kecil melalui *low-rank joint compression*, mengurangi ukuran KV-cache drastis tanpa mengorbankan kualitas. Ini memungkinkan inferensi yang jauh lebih efisien pada context panjang.
+Diperkenalkan oleh DeepSeek-V2/V3/V4, **MLA** mengatasi batasan memori dari **KV-cache** yang sangat membengkak saat melayani jutaan token secara bersamaan.
+
+#### Konteks: Masalah KV-Cache (MQA vs GQA)
+- **MHA (Multi-Head Attention)**: Setiap Query head memiliki Key head dan Value head sendiri. VRAM KV-cache tersedot sangat cepat.
+- **MQA (Multi-Query Attention)**: Semua Query head berbagi 1 Key head dan 1 Value head. Menghemat VRAM hingga $\approx 8\times$, tapi kualitas model turun drastis karena representasi Key/Value menjadi terlalu sempit.
+- **GQA (Grouped-Query Attention)**: Query head dikelompokkan (misal 8 head per group), dan setiap kelompok berbagi 1 Key dan Value head (standar Llama-3). Ini adalah jalan tengah yang baik.
+
+#### Solusi MLA: Low-Rank Joint Compression
+MLA memotong kebutuhan KV-cache lebih ekstrem daripada GQA **tanpa menurunkan kualitas representasi model** melalui kompresi joint rank-rendah (low-rank projection):
+
+1. **Kompresi Key dan Value**: Alih-alih menyimpan vektor $K$ dan $V$ asli yang berdimensi besar untuk setiap token, MLA memproyeksikan keduanya secara bersamaan ke dalam satu ruang latent berdimensi sangat kecil ($d_c \ll d_{\text{model}}$, misal 512 dimensi):
+   $$\mathbf{c}_t^{KV} = \text{Linear}_{\text{down}}(\mathbf{h}_t)$$
+   Di mana $\mathbf{c}_t^{KV}$ adalah representasi terkompresi yang disimpan dalam KV-cache.
+2. **Rekonstruksi saat Inferensi**: Saat model melakukan komputasi attention, model melakukan up-projection secara instan untuk merekonstruksi Key dan Value dari latent vector tersebut:
+   $$\mathbf{k}_t = \mathbf{c}_t^{KV} W_{UK}, \quad \mathbf{v}_t = \mathbf{c}_t^{KV} W_{UV}$$
+3. **Optimasi RoPE**: Karena RoPE (Rotary PE) tidak kompatibel dengan kompresi matriks linear di atas (rotasi merusak properti dekomposisi matriks), MLA memisahkan sebagian kecil dimensi Query dan Key untuk diberi RoPE secara independen, kemudian digabungkan (concatenated) kembali.
+
+#### Hasil Akhir MLA
+MLA menghemat ukuran KV-cache hingga **93%** dibandingkan MHA standar, bahkan melampaui efisiensi GQA, namun dengan performa representasi yang tetap setara dengan MHA penuh. Hal inilah yang memungkinkan model DeepSeek melayani context window 128K+ token pada traffic produksi yang sangat padat secara murah.
 
 ---
 
 ## 📖 State Space Models (SSM) & Mamba: Pesaing Transformer
 
-### Konteks historis
+### Konteks Historis
+Sebelum Transformer mendominasi, recurrent neural networks (RNN) adalah standar untuk sequence modeling. RNN memiliki sifat komputasi sekuensial yang sangat lambat dilatih. Pada 2022-2023, peneliti mengadopsi kembali **State Space Models (SSM)** dari bidang teori kontrol dan signal processing untuk NLP, menciptakan model dengan efisiensi RNN namun bisa dilatih secara paralel.
 
-Sebelum Transformer, ada model *State Space* dari kontrol sistem dan signal processing. Pada 2022-2023, peneliti mulai mengadaptasinya untuk NLP dengan hasil yang mengejutkan.
+### Intuisi SSM vs Attention
+- **Attention**: Saat memproses token baru, model melihat kembali *seluruh* token masa lalu di KV-cache. (Kompleksitas memori $\mathcal{O}(n^2)$).
+- **SSM**: Model memproses token satu per satu secara linear, namun memperbarui satu ringkasan state internal (**hidden state**) yang komprehensif. (Kompleksitas memori $\mathcal{O}(n)$).
 
-### Intuisi SSM
+### Mamba-1, Mamba-2, dan Mamba-3 (Masa Depan Hybrid)
 
-**Analogi sederhana**: Bayangkan kamu membaca buku. 
-- **Attention**: Kamu berhenti, melihat kembali semua halaman sebelumnya untuk mencari konteks
-- **SSM**: Kamu terus membaca sambil menyimpan "ringkasan" di kepala, yang kamu update setiap membaca kata baru
+- **Mamba-1 (2023)**: Memperkenalkan *Selective State Spaces* — kemampuan matriks transisi SSM untuk berubah secara dinamis berdasarkan konten input token. Hal ini memungkinkannya "memilih" informasi mana yang perlu diingat dan mana yang perlu dibuang.
+- **Mamba-2 (2024)**: Memperkenalkan **Structured State Space Duality (SSD)**. Mamba-2 menyederhanakan struktur matriks transisi agar secara matematis setara dengan attention semi-sparse. Perubahan ini memungkinkan Mamba-2 diparalelkan secara penuh menggunakan GPU Tensor Cores, meningkatkan kecepatan training hingga $2\times$ sampai $8\times$.
+- **Mamba-3 (Maret 2026 Update)**: Dirilis untuk menyempurnakan kelemahan klasik Mamba dalam hal *associative recall* (kemampuan mengingat asosiasi fakta acak yang sangat jauh) yang biasanya menjadi keunggulan mutlak Transformer. Mamba-3 mengoptimalkan interaksi selective state dan meminimalkan parameter redundancy.
 
-Alih-alih "memperhatikan semua token sekaligus" (seperti Attention), SSM mempertahankan sebuah *hidden state* yang terus diperbarui saat memproses token satu per satu — mirip RNN, tapi dengan matematika yang jauh lebih stabil dan parallelizable.
+#### Keunggulan Mamba vs Transformer
+- **Kompleksitas Linear $\mathcal{O}(n)$**: Biaya komputasi dan memori bertambah secara linear terhadap panjang teks, bukan kuadratis.
+- **KV-Cache Free**: Tidak perlu menyimpan KV-cache yang besar. Hanya butuh satu hidden state berdimensi tetap untuk melakukan generasi, menjadikannya sangat hemat memori pada deployment skala besar.
+- **Kecepatan Inferensi Konstan**: Latensi per token baru tetap sama meskipun memproses jutaan token.
 
-### Mamba (Gu & Dao, 2023)
+#### Kelemahan Mamba
+- **In-Context Learning (ICL) Lebih Lemah**: Dibandingkan Transformer dengan ukuran parameter yang sama, Mamba kurang efisien dalam belajar dari contoh-contoh di dalam prompt (few-shot learning).
+- **Akurasi Asosiasi Detail Rendah**: Untuk tugas penalaran logika yang sangat ketat (seperti kompilasi kode pemrograman atau matematika multi-langkah), Mamba murni sering kehilangan fokus detail.
 
-Mamba adalah SSM yang paling berpengaruh. Inovasinya: *selective state spaces* — model bisa memilih secara adaptif informasi mana yang perlu dipertahankan di hidden state berdasarkan input. **Mamba-2** (2024) menyederhanakan arsitektur dan menunjukkan koneksi mendalam antara SSM dan Attention.
+### Update 2026: Arsitektur Hybrid & Teknik "Priming"
+Melihat trade-off di atas, industri di 2026 tidak lagi mempertentangkan Mamba vs Transformer. Standar industri beralih ke **Hybrid SSM-Transformer** (seperti seri Jamba 1.5, Bamba, dan IBM Granite):
+- Model menumpuk block secara selang-seling: misalnya, 4 block SSM diikuti 1 block Attention.
+- Block Attention menjaga kemampuan penalaran global dan in-context learning.
+- Block SSM mengurangi KV-cache total hingga 80%, memungkinkan model berjalan cepat pada sequence jutaan token.
 
-**Contoh code sederhana SSM (ilustratif):**
-
-```python
-import torch
-import torch.nn as nn
-
-class SimpleSSM(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        # Matrix A: how state evolves
-        self.A = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
-        # Matrix B: how input affects state
-        self.B = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
-        # Matrix C: how to read out state
-        self.C = nn.Parameter(torch.randn(hidden_dim, hidden_dim))
-        
-    def forward(self, x):
-        # x shape: (batch_size, seq_len, hidden_dim)
-        batch_size, seq_len, _ = x.shape
-        
-        hidden_state = torch.zeros(batch_size, 1, x.size(-1), device=x.device)
-        outputs = []
-        
-        for t in range(seq_len):
-            x_t = x[:, t:t+1, :]
-            # Update hidden state: h_{t+1} = A*h_t + B*x_t
-            hidden_state = torch.matmul(hidden_state, self.A) + torch.matmul(x_t, self.B)
-            # Output: y_t = C*h_t
-            y_t = torch.matmul(hidden_state, self.C)
-            outputs.append(y_t)
-            
-        return torch.cat(outputs, dim=1)
-```
-
-### Keunggulan Mamba vs Transformer
-
-- Kompleksitas **O(n)** terhadap panjang sequence — linear, bukan quadratic
-- Efisien untuk context yang sangat panjang (jutaan token)
-- Inferensi lebih cepat karena tidak perlu menyimpan seluruh KV-cache
-
-### Kelemahan Mamba
-
-- Pada benchmark bahasa standar (≤ 4K token), masih kalah dari Transformer dengan ukuran yang sama
-- "Recall" informasi dari konteks sangat jauh tidak sebaik Attention
-- Ekosistem dan tooling masih lebih kecil dari Transformer
-
-### Status 2026
-
-Arsitektur hybrid (Transformer + SSM) seperti **Jamba 1.5** (AI21), **Zamba** (Zyphra), dan model-model riset lainnya sudah menunjukkan hasil menjanjikan. Beberapa perusahaan juga mengeksplorasi **RWKV-6** dan **Griffin** sebagai alternatif linear-time. Trend utamanya: bukan "Mamba vs Transformer" tapi "bagaimana menggabungkan keunggulan keduanya."
+#### Priming (Metode Inisialisasi Hybrid Terbaru)
+Membangun model hybrid dari nol sangat mahal. Pada Mei 2026, teknik **Priming** diperkenalkan untuk mengatasi ini:
+- Kita mengambil model Transformer murni yang sudah di-pretrain (misal Llama-3).
+- Sebagian block Transformer di-distill dan dikonversi menjadi block SSM.
+- Model hybrid baru ini kemudian di-fine-tune singkat.
+- Teknik ini memangkas biaya training model hybrid baru hingga **90%** karena mendaur ulang pengetahuan dari model Transformer yang sudah matang.
 
 ---
 
@@ -260,11 +278,21 @@ Instruct Model (Siap digunakan)
 
 **Penjelasan setiap tahap**:
 
-1. **SFT (Supervised Fine-Tuning)**: Model belajar format instruksi-respon. Dataset berisi ribuan contoh "User: pertanyaan → Assistant: jawaban". Model belajar bahwa format tertentu harus diikuti.
+1. **SFT (Supervised Fine-Tuning)**: Model belajar format instruksi-respon. Dataset berisi ribuan contoh "User: pertanyaan → Assistant: jawaban" buatan kurator manusia. Model belajar bahwa prompt harus diikuti dengan format tertentu (bukan sekadar meneruskan teks web acak).
 
-2. **RLHF/DPO/GRPO**: Model belajar *kualitas* output. Manusia menilai beberapa respon, model belajar preferensi (misal: jawaban yang lebih detail lebih baik, hindari konten berbahaya). GRPO adalah teknik baru dari DeepSeek yang lebih efisien.
+2. **Alignment (RLHF / DPO / GRPO)**: Model belajar menyelaraskan outputnya dengan nilai-nilai manusia (berguna, jujur, aman):
+   - **RLHF (Reinforcement Learning from Human Feedback)**: Menggunakan model reward terpisah untuk menilai skor output, lalu melatih model utama dengan algoritma PPO (Proximal Policy Optimization). Sangat rumit karena melibatkan 4 model sekaligus di VRAM (Policy, Reference, Reward, Value).
+   - **DPO (Direct Preference Optimization)**: Membuang model reward terpisah. DPO langsung mengoptimasi model menggunakan data preferensi biner (pasangan respon "accepted" vs "rejected") melalui fungsi loss matematis yang elegan.
+   - **GRPO (Group Relative Policy Optimization - DeepSeek Breakthrough)**: 
+     Algoritma RLHF modern yang merevolusi cara melatih model *reasoning* (seperti DeepSeek-R1):
+     - Alih-alih memelihara model **Value** yang besar di memori untuk menghitung estimasi keuntungan (baseline/advantage), GRPO melakukan **sampling kelompok**.
+     - Untuk setiap prompt, model memproduksi sekelompok respon (misal $G = 8$ respon).
+     - Reward untuk setiap respon dihitung (misalnya melalui test suite untuk coding, atau jawaban biner benar/salah untuk matematika).
+     - **Advantage relatif** dihitung secara instan dengan menormalisasi reward di dalam kelompok tersebut (z-score relative to the group).
+     - Model di-update berdasarkan keunggulan relatif respon tersebut terhadap rekan-rekannya di kelompok yang sama.
+     - **Keuntungan**: Menghemat memori GPU secara ekstrem (karena membuang model Value dan model Reward) dan melatih kemampuan *self-correction* model dengan sangat cepat pada tugas logika terstruktur.
 
-**Hasil akhir**: Mampu mengikuti instruksi, berdialog, dan menghindari output berbahaya. Punya "kepribadian" yang konsisten.
+**Hasil akhir**: Model siap digunakan untuk dialog, mengikuti instruksi kompleks, dan bernalar otonom tanpa mengalami kegagalan alignment atau bias respon monoton.
 
 ### Kapan pakai yang mana?
 
@@ -299,21 +327,104 @@ Instruct Model (Siap digunakan)
 
 **Kenapa salah**: Router di MoE bisa mengalami *load imbalance* — beberapa expert terlalu sering dipakai, yang lain tidak pernah. Ini bikin training tidak stabil. Teknik seperti *auxiliary loss* atau *expert dropout* dibutuhkan untuk memaksa distribusi yang merata.
 
+### 🔬 Eksperimen Google Colab: Visualisasi MoE Router & Expert Collapse
+
+Copy-paste kode ini ke Google Colab (cukup gunakan CPU) untuk mensimulasikan bagaimana router memilih expert, memvisualisasikan data affinity, dan memahami fenomena "expert collapse":
+
+```python
+# ============================================================
+# EKSPERIMEN: MoE Router & Expert Selection Visualization
+# ============================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+
+class MiniMoE(nn.Module):
+    """Simplified MoE layer untuk visualisasi."""
+    def __init__(self, hidden_dim, num_experts=8, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(hidden_dim, num_experts)
+        
+    def forward(self, x):
+        batch, seq_len, hidden = x.shape
+        router_logits = self.router(x)  # (batch, seq_len, num_experts)
+        top_k_logits, top_k_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)
+        return router_logits, top_k_indices, top_k_weights
+
+# Inisialisasi
+hidden_dim = 64
+num_experts = 8
+moe = MiniMoE(hidden_dim, num_experts, top_k=2)
+
+# Generate 200 token random
+torch.manual_seed(42)
+x = torch.randn(1, 200, hidden_dim)
+
+with torch.no_grad():
+    logits, indices, weights = moe(x)
+
+# Hitung beban per expert
+expert_counts = torch.zeros(num_experts)
+for k in range(2):
+    for e in range(num_experts):
+        expert_counts[e] += (indices[0, :, k] == e).sum().item()
+
+# Visualisasi
+fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+
+# Plot 1: Load imbalance
+ax = axes[0]
+colors = plt.cm.Set3(np.linspace(0, 1, num_experts))
+ax.bar(range(num_experts), expert_counts.numpy(), color=colors)
+ax.axhline(y=200*2/num_experts, color='red', linestyle='--', label='Ideal Balanced')
+ax.set_xlabel('Expert ID'); ax.set_ylabel('Beban Token')
+ax.set_title('Distribusi Beban Expert')
+ax.legend()
+
+# Plot 2: Heatmap Logits Router (50 Token Pertama)
+ax = axes[1]
+im = ax.imshow(logits[0, :50, :].numpy().T, aspect='auto', cmap='viridis')
+ax.set_xlabel('Token Position'); ax.set_ylabel('Expert ID')
+ax.set_title('Logits Router (Afinitas Expert)')
+plt.colorbar(im, ax=ax)
+
+# Plot 3: Expert Selection Pattern (50 Token Pertama)
+ax = axes[2]
+selection = indices[0, :50, :].numpy()
+ax.scatter(range(50), selection[:, 0], c='blue', s=30, label='Top-1 Expert', alpha=0.7)
+ax.scatter(range(50), selection[:, 1], c='orange', s=30, label='Top-2 Expert', alpha=0.7)
+ax.set_xlabel('Token Position'); ax.set_ylabel('Expert ID')
+ax.set_title('Expert Pilihan Router')
+ax.legend()
+
+plt.suptitle('Analisis Mekanisme Perutean MoE (Mixture of Experts)', fontsize=14, fontweight='bold')
+plt.tight_layout(); plt.show()
+
+# Imbalance score
+imbalance = expert_counts.max().item() / (expert_counts.min().item() + 1e-9)
+print(f"Rasio Imbalance Beban: {imbalance:.2f}x")
+```
+
 ---
 
 ## 🧩 Latihan
 
 ### Level 1 — Recall
+Jelaskan dengan analogi sederhana: apa perbedaan antara Dense Model (Transformer biasa) dan MoE (Sparse Model)? Mengapa total memori yang dibutuhkan MoE tetap besar meskipun komputasinya hemat?
 
-Jelaskan dengan analogi sederhana: apa perbedaan antara Dense Model (Transformer biasa) dan Sparse Model (MoE)? Mengapa ini penting untuk efisiensi?
-
-### Level 2 — Eksplorasi
-
-Cari perbandingan benchmark DeepSeek-V4-Pro vs Llama 4 Maverick. Pada task apa MoE unggul? Pada task apa ia tidak unggul? Apa implikasinya untuk pemilihan model di produksi?
+### Level 2 — Aplikasi
+Jalankan eksperimen MoE di atas di Google Colab.
+- Lihat grafis **Distribusi Beban Expert**. Apakah rata atau ada expert tertentu yang mendapatkan token jauh lebih banyak daripada expert lainnya?
+- Jika rasio imbalance-nya di atas $3\times$, ini adalah indikasi awal dari **expert collapse**. Bagaimana DeepSeek mencegah hal ini saat training model aslinya?
 
 ### Level 3 — Riset
-
-Cari paper atau blogpost yang membahas arsitektur **Jamba 1.5** atau **Mamba-2**. Apa klaim keunggulannya? Bagaimana mereka menggabungkan SSM dan Attention? Apakah ada benchmark yang memvalidasi klaim tersebut?
+Cari tahu tentang teknik **DPO** dan **GRPO** untuk alignment LLM. Apa keuntungan utama GRPO dibandingkan RLHF tradisional yang menggunakan PPO dalam hal penggunaan memori GPU selama training?
 
 ---
 
@@ -321,18 +432,15 @@ Cari paper atau blogpost yang membahas arsitektur **Jamba 1.5** atau **Mamba-2**
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| MoE | Banyak "expert" kecil; hanya sebagian yang aktif per token — efisiensi tinggi |
-| Quadratic Attention | Masalah skalabilitas; FlashAttention & MLA mempercepat tanpa mengubah output |
-| Mamba/SSM | Alternatif O(n) untuk sequence panjang; hybrid dengan Transformer paling menjanjikan |
-| Base vs Instruct | Base = prediksi token; Instruct = ikuti instruksi; keduanya punya use case berbeda |
+| **MoE** | Arsitektur di mana token diproses secara selektif oleh subset expert, menghemat biaya komputasi per token. |
+| **Expert Collapse** | Kondisi abnormal di mana router hanya memilih 1-2 expert saja; dicegah dengan auxiliary loss atau dynamic bias. |
+| **MLA (Multi-head Latent Attention)** | Teknik kompresi joint key-value yang memangkas KV-cache hingga 93% tanpa degradasi performa. |
+| **Mamba / SSM** | Model dengan kompleksitas linear $\mathcal{O}(n)$ yang sangat efisien untuk sequence panjang, sering digabungkan dengan Transformer (Hybrid). |
+| **Priming** | Metode pemotongan biaya training model hybrid dengan mengonversi model Transformer pretrained menjadi hybrid. |
+| **GRPO** | Algoritma alignment hemat memori yang membuang model Critic/Value dengan memanfaatkan advantage relative dalam kelompok output. |
 
-> **Takeaway utama**: Arsitektur NLP terus berkembang untuk mengatasi bottleneck skalabilitas. Pahami trade-off setiap pendekatan — tidak ada arsitektur yang "terbaik" untuk semua kasus.
+> **Takeaway utama**: Mengatasi bottleneck skalabilitas Transformer di 2026 melibatkan tiga pilar: efisiensi parameter (MoE), efisiensi KV-cache (MLA), arsitektur linear-time (Mamba/Hybrid), dan alignment hemat memori (GRPO).
 
 ---
 
 **Selanjutnya → Fase 3: Rekayasa Sistem** — Cukup teori model. Saatnya membangun sistem AI yang nyata.
-```
-
-- ✅ Menggunakan line breaks yang jelas antar section
-
-Markdown ini siap dipakai untuk dokumentasi atau materi pembelajaran!

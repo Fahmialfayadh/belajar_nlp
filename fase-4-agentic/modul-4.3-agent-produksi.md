@@ -155,41 +155,71 @@ Kunci keunggulan LangGraph: **graph mendukung cycle**. Pipeline (DAG — Directe
                    retry ────────────────┘
 ```
 
-#### Persistence & Checkpointing
+#### Persistence & Checkpointing: Durable Execution
 
-LangGraph mendukung **durable execution** — state bisa disimpan di checkpoint tertentu. Ini memungkinkan:
-- **Recovery dari kegagalan**: Kalau proses crash, lanjutkan dari checkpoint terakhir, bukan dari awal
-- **Human-in-the-loop**: Pause workflow, minta persetujuan manusia, lalu lanjutkan
-- **Debuggability**: Lihat state di setiap titik untuk memahami keputusan agent
+LangGraph mendukung **durable execution** — state disimpan secara berkala di setiap checkpoint node. Hal ini memungkinkannya mengelola *long-running tasks* secara andal.
+
+##### LangGraph Persistence Backends di Produksi
+Di lingkungan development lokal, kita biasanya menggunakan `MemorySaver` yang bersifat in-memory. Namun, **in-memory saver tidak boleh digunakan di produksi** karena state akan hilang saat container/server restart. Di 2026, standardisasi backend database persistensi adalah:
+
+1. **`PostgresSaver` (RDBMS)**:
+   - Checkpoint disimpan di tabel relasional PostgreSQL.
+   - Paling sering direkomendasikan untuk tugas dengan persistensi tinggi yang membutuhkan keamanan transaksi (transactional consistency) dan audit log lengkap.
+2. **`RedisSaver` / Memory Database**:
+   - Menyimpan checkpoints di Redis menggunakan struktur data key-value cepat.
+   - Cocok untuk real-time chatbot yang membutuhkan latency baca/tulis state yang sangat rendah (<10ms).
+3. **Durable Task / Workflow Engine (Temporal/AWS Step Functions)**:
+   - Untuk orkestrasi skala enterprise yang sangat kritis, checkpoint LangGraph dibungkus di dalam durable workflow engine eksternal. Jika infrastruktur backend mati di tengah jalan, status eksekusi dilanjutkan secara presisi tanpa duplikasi tool calls.
 
 ---
 
-### 📖 Evaluasi Agent: Bagaimana Tahu Agent-mu Bekerja Benar?
+### 📖 Evaluasi & Observability Agent
 
 Evaluasi agent jauh lebih sulit dari evaluasi model biasa. Untuk model, kamu bisa ukur akurasi pada dataset test. Untuk agent, kamu harus mengevaluasi *seluruh trajectory* — bukan cuma jawaban akhir, tapi setiap keputusan, setiap tool call, setiap langkah reasoning.
 
-#### Empat Pilar Evaluasi Agent
+#### Empat Pilar Observability & Evaluasi
+1. **Monitoring — "Apa yang terjadi sekarang?"**
+   - Latency per langkah dan total
+   - Token consumption per request
+   - Error rate dan jenis error
+   - Tool call frequency dan distribusi
+2. **Tracing — "Kenapa agent melakukan itu?"**
+   - Rekam seluruh *trajectory*: input → thinking → tool calls → observations → output
+   - Setiap langkah harus bisa di-drill-down untuk melihat prompt, response, dan state
+   - Ini analog dengan *stack trace* dalam debugging tradisional, tapi untuk reasoning
+3. **Evaluation — "Apakah hasilnya benar?"**
+   - **Rule-based metrics**: Apakah agent menyelesaikan task? Berapa langkah? Apakah ada loop?
+   - **LLM-as-a-judge**: Gunakan model lain untuk menilai kualitas jawaban agent
+   - **Regression testing**: Simpan test cases dan jalankan ulang setiap kali ada perubahan
+4. **Governance — "Siapa yang bertanggung jawab?"**
+   - Audit trail: siapa yang memicu agent, kapan, dan apa yang dilakukan
+   - Policy enforcement: aturan eksplisit tentang apa yang boleh dan tidak boleh dilakukan agent
 
-**1. Monitoring — "Apa yang terjadi sekarang?"**
-- Latency per langkah dan total
-- Token consumption per request
-- Error rate dan jenis error
-- Tool call frequency dan distribusi
+#### Workflow Produksi 2026: Trace-to-Dataset
 
-**2. Tracing — "Kenapa agent melakukan itu?"**
-- Rekam seluruh *trajectory*: input → thinking → tool calls → observations → output
-- Setiap langkah harus bisa di-drill-down untuk melihat prompt, response, dan state
-- Ini analog dengan *stack trace* dalam debugging tradisional, tapi untuk reasoning
+Meningkatkan kualitas agent di produksi secara berkesinambungan membutuhkan sistem feedback loop yang stabil. Di 2026, hal ini diwujudkan melalui **Trace-to-Dataset Workflow**:
 
-**3. Evaluation — "Apakah hasilnya benar?"**
-- **Rule-based metrics**: Apakah agent menyelesaikan task? Berapa langkah? Apakah ada loop?
-- **LLM-as-a-judge**: Gunakan model lain untuk menilai kualitas jawaban agent
-- **Regression testing**: Simpan test cases dan jalankan ulang setiap kali ada perubahan
+```
+[User Query di Produksi] ──→ [Agent Execution] ──→ [Trace Tersimpan di Langfuse/Smith]
+                                                            │
+                                                            ▼ (Deteksi Gagal: Bad Score/Loop)
+                                                    [Koleksi & Filter Trace]
+                                                            │
+                                                            ▼ (Kurasi & Masking PII)
+                                                    [Dokumentasi Ground Truth]
+                                                            │
+                                                            ▼
+                                                    [Regression Dataset Baru]
+                                                            │
+                                                            ▼
+                                         [CI/CD Eval: Uji Prompt/Model Baru]
+```
 
-**4. Governance — "Siapa yang bertanggung jawab?"**
-- Audit trail: siapa yang memicu agent, kapan, dan apa yang dilakukan
-- Policy enforcement: aturan eksplisit tentang apa yang boleh dan tidak boleh dilakukan agent
-- Compliance: memenuhi regulasi (EU AI Act, GDPR, dll.)
+Langkah-langkah implementasinya:
+1. **Deteksi Anomali**: Sistem monitoring menandai (tag) trace yang memiliki score kepuasan user rendah, waktu eksekusi yang terlalu lama (timeout), atau loop yang terdeteksi secara otomatis (runaway loops).
+2. **Sanitasi PII**: Data pribadi sensitif (PII - Personally Identifiable Information) di dalam trace dibersihkan secara otomatis.
+3. **Kurasi & Golden Dataset**: Tim QA/Developer melengkapi trace gagal tersebut dengan respon ideal (ground truth), lalu memasukkannya ke dalam **Regression Dataset (Golden Dataset)**.
+4. **CI/CD Integration**: Setiap kali developer mengubah prompt system, konfigurasi model, atau menambah tool baru, pipeline CI/CD menjalankan dataset ini secara offline. Perubahan hanya dideploy jika tingkat keberhasilan agent meningkat atau minimal konstan.
 
 #### Ekosistem Tools Evaluasi (2026)
 
@@ -200,8 +230,6 @@ Evaluasi agent jauh lebih sulit dari evaluasi model biasa. Untuk model, kamu bis
 | **Langfuse** | Tracing dan monitoring — pilihan populer untuk tim yang butuh self-hosted | Open source |
 | **Arize Phoenix** | OpenTelemetry-native observability | Open source |
 | **Laminar** | Debugging long-running agents dengan deep trace execution | Open source |
-
-**Workflow terbaik di 2026**: "trace-to-dataset" — kegagalan di produksi secara otomatis dijadikan test case baru untuk mencegah regresi yang sama terulang.
 
 ---
 
@@ -261,121 +289,93 @@ Desain sistemmu dengan asumsi bahwa LLM *akan* dibajak. Pertanyaannya bukan "bag
 **Layer 5 — Monitoring: Deteksi anomali**
 - Trace setiap langkah agent secara real-time
 - Alert jika agent melakukan aksi di luar pola normal (anomaly detection)
-- Audit trail lengkap untuk setiap tool call yang dieksekusi
-
-#### Checklist Keamanan Agent untuk Produksi
-
-| Layer | Pertanyaan | Tindakan |
-|---|---|---|
-| Input | Apakah agent membaca data dari sumber external? | Sanitasi dan batasi ukuran input |
-| Reasoning | Apakah prompt system terlindungi? | Prompt hardening, hirarki instruksi |
-| Action | Apakah ada aksi yang irreversible? | HITL gate untuk aksi berisiko |
-| Identity | Apakah agent punya akses broad ke sistem? | Least privilege, scoped credentials |
-| Monitoring | Bisa audit siapa melakukan apa, kapan? | Tracing, logging, alerting |
-
----
-
-### 💻 Kode: Agent dengan LangGraph + Guardrails
+- Audit trail lengkap untuk setiap tool ca### 💻 Kode: Agent dengan LangGraph + Guardrails (Konseptual)
 
 ```python
-# Contoh konseptual — menunjukkan arsitektur, bukan runnable penuh
-# Butuh: pip install langgraph langchain-anthropic
+# Contoh konseptual orkestrasi guardrails di LangGraph
+# run: pip install langgraph
 
 from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
-# === 1. DEFINISIKAN STATE ===
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     tool_call_count: int
     needs_human_approval: bool
 
-# === 2. DEFINISIKAN NODES ===
-def reasoning_node(state: AgentState) -> dict:
-    """Node: LLM berpikir dan memutuskan aksi selanjutnya."""
-    # Panggil LLM dengan messages saat ini
-    response = llm.invoke(state["messages"])
-    return {"messages": [response]}
-
 def tool_execution_node(state: AgentState) -> dict:
-    """Node: Eksekusi tool yang diminta LLM."""
     last_msg = state["messages"][-1]
     tool_call = last_msg.tool_calls[0]
     
     # Guardrail: cek apakah tool call membutuhkan approval
-    high_risk_tools = ["send_email", "delete_record", "deploy_code"]
+    high_risk_tools = ["send_email", "delete_record"]
     if tool_call["name"] in high_risk_tools:
         return {
             "needs_human_approval": True,
-            "messages": [f"⚠️ Tool berisiko tinggi: {tool_call['name']}. Menunggu persetujuan..."]
+            "messages": [f"⚠️ Aksi berisiko: {tool_call['name']}. Menunggu persetujuan..."]
         }
     
-    # Eksekusi tool
     result = execute_tool(tool_call)
     return {
         "messages": [result],
         "tool_call_count": state["tool_call_count"] + 1,
     }
-
-def human_approval_node(state: AgentState) -> dict:
-    """Node: Minta persetujuan manusia untuk aksi berisiko."""
-    # Di produksi, ini bisa kirim notifikasi ke Slack, email, atau dashboard
-    print("🔴 MENUNGGU PERSETUJUAN MANUSIA")
-    print(f"   Tool: {state['messages'][-2].tool_calls[0]}")
-    approval = input("   Setujui? (y/n): ")
-    
-    if approval.lower() == "y":
-        result = execute_tool(state["messages"][-2].tool_calls[0])
-        return {"messages": [result], "needs_human_approval": False}
-    else:
-        return {"messages": ["Aksi dibatalkan oleh operator."], "needs_human_approval": False}
-
-# === 3. DEFINISIKAN CONDITIONAL EDGES ===
-def route_after_reasoning(state: AgentState) -> Literal["tool_execution", "end"]:
-    """Conditional edge: apakah LLM mau pakai tool atau sudah selesai?"""
-    last_msg = state["messages"][-1]
-    
-    # Guardrail: batas maksimum tool calls untuk mencegah runaway loops
-    if state["tool_call_count"] >= 10:
-        return "end"
-    
-    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-        return "tool_execution"
-    return "end"
-
-def route_after_tool(state: AgentState) -> Literal["human_approval", "reasoning"]:
-    """Conditional edge: apakah butuh approval manusia?"""
-    if state["needs_human_approval"]:
-        return "human_approval"
-    return "reasoning"
-
-# === 4. BANGUN GRAPH ===
-graph = StateGraph(AgentState)
-
-# Tambah nodes
-graph.add_node("reasoning", reasoning_node)
-graph.add_node("tool_execution", tool_execution_node)
-graph.add_node("human_approval", human_approval_node)
-
-# Tambah edges
-graph.set_entry_point("reasoning")
-graph.add_conditional_edges("reasoning", route_after_reasoning)
-graph.add_conditional_edges("tool_execution", route_after_tool)
-graph.add_edge("human_approval", "reasoning")  # Setelah approval, kembali ke reasoning
-
-# Kompilasi
-agent = graph.compile()
-
-# Visualisasi flow:
-# reasoning → [has tool call?] → tool_execution → [high risk?] → human_approval
-#     ↑                              │                                │
-#     └──────────────────────────────┘                                │
-#     └───────────────────────────────────────────────────────────────┘
 ```
 
-> **Yang perlu kamu perhatikan**: Perhatikan tiga guardrail yang ada di kode ini: (1) batas maksimum tool calls di `route_after_reasoning`, (2) deteksi high-risk tools di `tool_execution_node`, (3) human approval gate di `human_approval_node`. Ini adalah pola minimum yang harus ada di setiap production agent.
+---
+
+### 🔬 Eksperimen Google Colab: Simulasi Monte Carlo Compounding Error
+
+Copy-paste kode Python ini ke Google Colab (CPU runtime) untuk menjalankan simulasi Monte Carlo 10.000 iterasi. Eksperimen ini memvisualisasikan bagaimana tingkat kegagalan agent bertambah secara eksponensial seiring jumlah langkah, membuktikan perlunya mekanisme checkpointing:
+
+```python
+# ============================================================
+# EKSPERIMEN: Monte Carlo Simulation — Compounding Error Agent
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def simulate_agent_runs(step_reliability, num_steps, num_simulations=10000):
+    """Berapa % agent yang bertahan (survive) sampai step terakhir?"""
+    # Theoretical curve
+    steps = np.arange(num_steps + 1)
+    theoretical_survival = (step_reliability ** steps) * 100
+    
+    # Monte Carlo simulation
+    sim_results = []
+    for _ in range(num_simulations):
+        survived = True
+        for step in range(1, num_steps + 1):
+            if np.random.random() > step_reliability:
+                survived = False
+                break
+        sim_results.append(survived)
+        
+    actual_survival_rate = np.mean(sim_results) * 100
+    return steps, theoretical_survival, actual_survival_rate
+
+# Parameter Uji
+reliabilities = [0.99, 0.97, 0.95, 0.90]
+max_steps = 25
+
+plt.figure(figsize=(12, 6))
+
+for r in reliabilities:
+    steps, theoretical, actual = simulate_agent_runs(r, max_steps)
+    plt.plot(steps, theoretical, label=f"Akurasi Step {r*100:.0f}% (Actual: {actual:.1f}%)", linewidth=2)
+
+plt.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='Batas Kritis 50%')
+plt.xlabel('Jumlah Langkah Agent (Steps)', fontsize=12)
+plt.ylabel('Probabilitas Sukses Total (%)', fontsize=12)
+plt.title('Efek Compounding Error pada Akurasi AI Agent', fontsize=14, fontweight='bold')
+plt.ylim(0, 105)
+plt.grid(alpha=0.3)
+plt.legend(fontsize=11)
+plt.show()
+```
 
 ---
 
@@ -385,23 +385,25 @@ agent = graph.compile()
 Testing di notebook dengan data bersih sangat berbeda dari produksi. Di produksi, ada distribution shift (query user yang tidak terprediksi), API yang berubah, timeout yang tidak terduga, dan data yang noisy. Evaluasi harus *continuous*, bukan one-time.
 
 **Jebakan 2: "Prompt injection bisa dicegah dengan prompt yang lebih baik"**
-Ini seperti bilang "SQL injection bisa dicegah dengan SQL yang lebih baik." Prompt hardening membantu, tapi bukan solusi. Pertahanan harus di level arsitektur — least privilege, HITL gates, output validation.
+Ini seperti menyatakan SQL injection bisa dicegah dengan sanitasi teks manual. Prompt hardening membantu, tapi bukan solusi. Pertahanan harus di level arsitektur — least privilege, HITL gates, output validation.
 
 **Jebakan 3: "Observability itu nice-to-have"**
-Tanpa tracing, kamu tidak tahu kenapa agent gagal. Tanpa monitoring, kamu tidak tahu *bahwa* agent gagal. Tanpa evaluation, kamu tidak tahu apakah update terakhirmu memperbaiki atau memperburuk agent. Observability bukan opsional — ini prerequisite untuk production.
+Tanpa tracing, kamu tidak tahu kenapa agent gagal. Tanpa monitoring, kamu tidak tahu *bahwa* agent gagal. Tanpa evaluation, kamu tidak tahu apakah update terakhirmu memperbaiki atau memperburuk agent. Observability bukan opsional — ini prerequisite untuk produksi.
 
 ---
 
 ### 🧩 Latihan
 
 **Level 1 — Recall:**
-Jelaskan dengan contoh nyata: mengapa compounding error membuat agent 20-langkah yang "95% akurat per langkah" sebenarnya gagal lebih sering daripada berhasil. Apa implikasinya untuk desain agent?
+Jelaskan konsep **Compounding Error** secara matematis. Mengapa sebuah agen dengan akurasi 90% per-step memiliki probabilitas kegagalan di atas 60% jika harus mengeksekusi workflow sepanjang 10 langkah?
 
-**Level 2 — Desain:**
-Kamu diminta membangun agent yang bisa mengelola jadwal meeting (buat, edit, hapus meeting di Google Calendar). Identifikasi: (a) Aksi mana yang butuh HITL gate? (b) Bagaimana kamu menerapkan least privilege? (c) Apa saja metrics yang perlu di-monitor? (d) Gambar graph LangGraph-nya.
+**Level 2 — Aplikasi:**
+Jalankan simulasi Monte Carlo di atas pada Google Colab.
+- Ubah parameter `max_steps` menjadi 50 (langkah yang sangat panjang untuk kode agent otonom).
+- Catat pada langkah keberapakah tingkat kesuksesan total agen dengan akurasi step 95% jatuh di bawah **10%**? Apa implikasinya terhadap batas toleransi loop di produksi?
 
-**Level 3 — Red Teaming:**
-Bayangkan kamu adalah attacker. Agent korbanmu adalah customer service agent yang bisa mengakses database pelanggan dan mengirim email. Rancang tiga skenario serangan prompt injection (satu direct, dua indirect). Lalu, rancang pertahanan untuk masing-masing skenario menggunakan prinsip yang dipelajari di modul ini.
+**Level 3 — Desain:**
+Rancang sebuah arsitektur pertahanan untuk agent asisten email korporat yang rentan terhadap **Indirect Prompt Injection** (misal: instruksi rahasia tersembunyi di dokumen lampiran email). Terapkan kelima layer keamanan: Input, Reasoning, Action, Identity (Least Privilege), dan Monitoring.
 
 ---
 
@@ -409,11 +411,14 @@ Bayangkan kamu adalah attacker. Agent korbanmu adalah customer service agent yan
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| Compounding Error | 95% per langkah = 36% di 20 langkah; agent multi-step rentan secara matematis |
-| LangGraph | State machine berbasis graph; nodes = fungsi, edges = kontrol flow, state = memori bersama |
-| Persistence | Checkpoint dan recovery; pause untuk HITL; debug via state inspection |
-| Evaluasi | 4 pilar: monitoring, tracing, evaluation, governance |
-| Prompt Injection | Masalah arsitektural, bukan model; assume compromise, minimize blast radius |
-| Least Privilege | Agent = untrusted user; scoped credentials, JIT permissions |
+| **Compounding Error** | Penurunan akurasi kumulatif secara eksponensial seiring bertambahnya jumlah aksi agent. Ditanggulangi dengan checkpointing. |
+| **LangGraph state** | Memori tunggal bersama (single source of truth) yang dipasangi reducer untuk mengelola aliran data graph. |
+| **Persistensi Produksi** | Penggunaan `PostgresSaver` (transaksional) atau `RedisSaver` (latency rendah) alih-alih `MemorySaver` lokal. |
+| **Trace-to-Dataset** | Alur devops AI di mana trace error di produksi di-masking, diverifikasi, dan dimasukkan ke test suite regression CI/CD. |
+| **Least Privilege** | Model keamanan yang memperlakukan agent sebagai pengguna luar dengan pembatasan skop API dan just-in-time token. |
 
-> **Takeaway utama**: Perbedaan antara demo agent dan production agent terletak pada tiga hal: orkestrasi yang terstruktur (LangGraph), evaluasi yang continuous (observability), dan keamanan yang berlapis (assume compromise). Tanpa ketiganya, agent-mu hanya akan bekerja di notebook.
+> **Takeaway utama**: Perbedaan antara agen demo di notebook dan agen siap produksi terletak pada tiga aspek: orkestrasi grafik status toleran-error (LangGraph), monitoring berkelanjutan berbasis dataset regresi (Trace-to-Dataset), dan keamanan berlapis (Least Privilege & HITL).
+
+---
+
+**Kembali ke [README.md](file:///home/data/kuliah/project/belajar_nlp/README.md)** untuk ringkasan seluruh Fase Pembelajaran NLP.

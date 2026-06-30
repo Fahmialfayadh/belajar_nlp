@@ -296,29 +296,59 @@ Sekarang Claude bisa langsung menggunakan tool `cek_cuaca`, membaca resource `da
 
 ---
 
+### 📖 Deep-Dive: MCP Transports & Keamanan di Produksi
+
+Memindahkan MCP dari eksperimen lokal (Claude Desktop) ke sistem produksi enterprise membutuhkan pemahaman tentang protokol transport dan keamanan.
+
+#### 1. Transports: Stdio vs SSE (HTTP)
+
+MCP mendukung dua jenis transport utama untuk komunikasi JSON-RPC 2.0:
+- **Stdio Transport**:
+  - Berjalan secara lokal. Host menjalankan sub-proses server dan berkomunikasi melalui `stdin` dan `stdout`.
+  - Sangat aman karena tidak ada port jaringan yang terbuka.
+  - Cocok untuk asisten lokal (seperti Cursor/VS Code plugin).
+- **SSE (Server-Sent Events) / HTTP Transport**:
+  - Menghubungkan client dan server yang berada di mesin/cloud berbeda secara remote.
+  - Client mengirimkan perintah JSON-RPC melalui request **HTTP POST** biasa.
+  - Server mengembalikan respon secara realtime menggunakan koneksi stream **SSE (Server-Sent Events)** satu arah.
+
+#### 2. Streamable HTTP (Stateless MCP)
+Pada arsitektur cloud serverless (seperti AWS Lambda atau Vercel Edge), menjaga koneksi SSE persisten adalah hal yang mahal dan tidak efisien.
+- **Streamable HTTP (Stateless HTTP)** diperkenalkan di 2026 sebagai transport alternatif.
+- Koneksi tidak perlu dibiarkan terbuka (stateless). Setiap request request-response berjalan mandiri, mirip REST API biasa, tetapi tetap mematuhi skema pesan JSON-RPC MCP.
+- Ini mempermudah load-balancing dan deployment multi-tenant di cluster Kubernetes.
+
+#### 3. Model Keamanan & Autentikasi (Security & Auth Model)
+Karena MCP server bisa memanggil sistem sensitif (database, cloud terminal), model keamanan sangat diperketat:
+- **Transport Layer Security (TLS)**: Semua koneksi remote SSE/HTTP wajib menggunakan HTTPS.
+- **Token Delegation**: Saat client memanggil server remote, ia menyertakan token otorisasi OAuth/JWT di header HTTP. Server MCP harus melakukan verifikasi token secara terpisah sebelum mengeksekusi tool.
+- **Sandboxing**: Host bertanggung jawab menjalankan local stdio server di dalam environment terisolasi (seperti gVisor atau Docker container ringkas) untuk menghindari malware mengeksploitasi filesystem lokal melalui tool filesystem.
+
+---
+
 ### ⚠️ Jebakan Umum
 
 **Jebakan 1: "MCP server = web server biasa"**
-Tidak. MCP server biasanya berkomunikasi via **stdio** (stdin/stdout), bukan HTTP endpoint. Ini membuatnya lebih ringan dan aman (tidak perlu expose port). Untuk deployment produksi, ada mode **Streamable HTTP** yang sedang dikembangkan untuk skenario stateless dan scalable.
+Tidak. Secara historis, MCP server berkomunikasi via **stdio** (stdin/stdout) lokal. Mengonversinya ke server remote membutuhkan konfigurasi transport SSE/HTTP atau Streamable HTTP, lengkap dengan manajemen SSL/TLS dan authentication layer.
 
 **Jebakan 2: "Semua MCP server aman untuk dipakai"**
-Hati-hati. Karena ekosistem MCP terdesentralisasi, siapa pun bisa mempublikasikan MCP server. Selalu verifikasi sumber server sebelum menggunakannya — terutama yang membutuhkan akses ke credential atau data sensitif.
+Hati-hati. Karena ekosistem MCP terdesentralisasi, siapa pun bisa mempublikasikan MCP server. Selalu verifikasi sumber server sebelum menggunakannya — terutama yang membutuhkan akses ke credential atau data sensitif. Sandboxing stdio server lokal adalah mitigasi wajib.
 
 **Jebakan 3: "A2A berarti agent harus saling melihat internal state"**
-Justru sebaliknya. Salah satu prinsip desain A2A adalah **opacity** — agent bisa berkolaborasi dan mendelegasikan tugas tanpa perlu mengekspos memori internal, konfigurasi tools, atau prompt system mereka ke agent lain.
+Justru sebaliknya. Salah satu prinsip desain A2A adalah **opacity** — agent bisa berkolaborasi dan mendelegasikan tugas tanpa perlu mengekspos memori internal, konfigurasi tools, atau prompt system mereka ke agent lain. Mereka berkomunikasi murni lewat penugasan Task dan pengembalian Artifact.
 
 ---
 
 ### 🧩 Latihan
 
 **Level 1 — Recall:**
-Jelaskan perbedaan antara MCP Tools, Resources, dan Prompts menggunakan analogi restoran: pelayan, menu, dan buku resep. Mengapa tiga primitif ini cukup untuk mengcover hampir semua skenario integrasi?
+Jelaskan perbedaan antara MCP Stdio transport dan SSE/HTTP transport. Kapan kamu harus memilih menggunakan masing-masing transport?
 
 **Level 2 — Aplikasi:**
-Modifikasi MCP server cuaca di atas. Tambahkan tool `perbandingan_cuaca(kota1, kota2)` yang membandingkan cuaca dua kota dan memberikan rekomendasi mana yang lebih nyaman untuk dikunjungi hari ini.
+Modifikasi FastMCP server cuaca di atas (kamu bisa menulis dan menjalankannya secara lokal di komputermu dengan perintah `uv run mcp_cuaca_server.py`). Tambahkan tool baru `rekomendasi_wisata(kota)` yang memanfaatkan tool `cek_cuaca` secara internal untuk memberikan daftar aktivitas outdoor yang disarankan.
 
 **Level 3 — Desain:**
-Rancang arsitektur multi-agent e-commerce menggunakan MCP dan A2A. Identifikasi: (a) Agent apa saja yang dibutuhkan? (b) MCP server apa yang diperlukan setiap agent? (c) Bagaimana A2A menghubungkan agent-agent tersebut? Gambar diagram arsitekturnya.
+Jelaskan bagaimana **Streamable HTTP** mengatasi keterbatasan koneksi persisten Server-Sent Events (SSE) pada arsitektur cloud serverless. Rancang skema autentikasi menggunakan OAuth2 untuk mengamankan MCP server remote yang dapat diakses oleh agent dari luar corporate network.
 
 ---
 
@@ -326,12 +356,16 @@ Rancang arsitektur multi-agent e-commerce menggunakan MCP dan A2A. Identifikasi:
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| Masalah N×M | Tanpa standar, setiap agent butuh integrasi kustom ke setiap tool — tidak skalabel |
-| MCP | Protokol standar agent-to-tool; tiga primitif: Tools, Resources, Prompts |
-| MCP Server | Service ringan yang mengekspos kemampuan; komunikasi via JSON-RPC 2.0 |
-| A2A | Protokol standar agent-to-agent; tiga konsep: Agent Cards, Tasks, Artifacts |
-| MCP vs A2A | Komplementer — MCP untuk tools, A2A untuk kolaborasi antar agent |
+| **Masalah $N \times M$** | Tanpa standar, integrasi setiap agent ke setiap tool menghasilkan puluhan baris kode kustom yang rapuh. |
+| **MCP** | Model Context Protocol — standardisasi open-source hubungan agent-to-tool di bawah Agentic AI Foundation. |
+| **Tiga Primitif MCP** | **Tools** (aksi aktif), **Resources** (data pasif yang bisa dibaca), dan **Prompts** (template instruksi terstruktur). |
+| **MCP Transports** | Local stdio (cepat/aman) vs remote SSE/HTTP (fleksibel/remote) vs Streamable HTTP (stateless/serverless). |
+| **Keamanan MCP** | Wajib menggunakan HTTPS, verifikasi token (OAuth/JWT), dan sandboxing process untuk server filesystem lokal. |
+| **A2A** | Agent2Agent — standardisasi kolaborasi agent-to-agent menggunakan Agent Cards, Tasks, dan Artifacts. |
 
-> **Takeaway utama**: MCP dan A2A adalah "jalan raya" yang menghubungkan agent ke dunia luar dan ke agent lain. Tanpa standar ini, setiap integrasi akan menjadi proyek custom yang mahal dan rapuh.
+> **Takeaway utama**: MCP dan A2A adalah "USB-C" bagi dunia AI Agentic. Mereka memisahkan kekhawatiran integrasi API kustom, memungkinkan tools dikembangkan sekali dan dikonsumsi oleh model mana pun secara instan dan aman di 2026.
+
+---
 
 **Selanjutnya → Modul 4.3: Agent di Produksi** — Membangun agent itu mudah. Menjalankannya secara andal di produksi? Itu tantangan sebenarnya.
+

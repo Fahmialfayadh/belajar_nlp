@@ -93,17 +93,28 @@ Hasilnya: fine-tune model 65 miliar parameter dengan satu GPU 48GB dengan kualit
 
 ---
 
-### 📖 Perkembangan Terbaru: DoRA, rsLoRA, dan LoRA+
+#### Deep-Dive: Rank Selection ($r$) & Scaling Factor ($\alpha$)
+Saat melakukan konfigurasi LoRA Config, kamu wajib memahami parameter berikut:
+- **Rank ($r$)**: Mengatur lebar matriks dekomposisi low-rank.
+  - Heuristik: $r=8$ atau $16$ cocok untuk task instruksi umum/formatting. $r=32$ atau $64$ dibutuhkan untuk pembelajaran domain spesifik yang sangat mendalam (seperti istilah medis baru atau bahasa pemrograman baru).
+- **Alpha ($\alpha$)**: Scaling factor untuk menyeimbangkan pengaruh adaptor LoRA terhadap model dasar.
+  - Heuristik: Selalu atur $\alpha$ sebesar **$2\times r$** (misal $r=8, \alpha=16$). Menjaga $\alpha$ konstan membantu kestabilan gradient dan kestabilan nilai learning rate saat kamu melakukan tuning rank $r$ yang berbeda.
 
-Sejak LoRA asli (2021), banyak variasi yang meningkatkan performanya:
+#### Target Modules: Di Mana Harus Memasang Adapter?
+LLM terdiri dari banyak matriks linear. Di layer mana kita harus menempelkan matriks $A$ dan $B$?
+- **Attention Modules saja (`q_proj`, `v_proj`)**: Standar LoRA asli (2021). Menghemat parameter paling ekstrem, namun performa kurang maksimal untuk task penalaran berat.
+- **All Linear Modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`)**: Standar industri modern. Menempelkan adapter ke modul Attention dan FFN sekaligus. Meskipun trainable parameter bertambah sedikit, performa model meningkat signifikan dan mendekati full fine-tuning.
 
-**DoRA (Weight-Decomposed Low-Rank Adaptation, 2024)** — Memisahkan magnitude dan arah pada weight matrix sebelum menerapkan LoRA, menghasilkan fine-tuning yang lebih stabil dan mendekati full fine-tuning.
+#### Update 2026: DoRA, rsLoRA, LoRA+, dan Unsloth
 
-**rsLoRA (Rank-Stabilized LoRA)** — Menyesuaikan scaling factor agar performa tetap stabil pada rank yang lebih tinggi.
+Beberapa inovasi optimasi adapter yang wajib diketahui:
 
-**LoRA+ (2024)** — Menggunakan learning rate yang berbeda untuk matriks A dan B, meningkatkan kecepatan konvergensi.
-
-Framework seperti **Unsloth** (2024-2025) menyediakan implementasi yang dioptimasi 2-5x lebih cepat dari PEFT standar dengan penggunaan memori yang lebih rendah — sangat berguna untuk fine-tuning pada GPU consumer.
+- **DoRA (Weight-Decomposed Low-Rank Adaptation, 2024)**: Memisahkan perubahan bobot menjadi dua komponen independen: **magnitude** (panjang/skalar) dan **direction** (arah/matriks low-rank). Hal ini secara dramatis meningkatkan stabilitas training dan akurasi model pada task logika.
+- **rsLoRA (Rank-Stabilized LoRA)**: Menskalakan adaptor menggunakan $\frac{1}{\sqrt{r}}$ alih-alih $\frac{1}{r}$. Menjaga stabilitas model ketika di-train pada rank $r$ yang besar.
+- **LoRA+ (2024)**: Menerapkan learning rate yang $4\times$ lebih besar pada matriks $B$ dibandingkan matriks $A$ untuk mempercepat konvergensi parameter.
+- **Unsloth (Framework Produksi Utama)**:
+  - Menyediakan kernel CUDA buatan tangan (handwritten CUDA kernels) yang dioptimalkan khusus untuk backpropagation model Llama, Mistral, dan Qwen.
+  - Mengurangi pemakaian memori hingga **60%** dan mempercepat training **2x - 5x lebih cepat** daripada PEFT standar tanpa mengurangi akurasi sedikit pun. Sangat direkomendasikan untuk training di GPU lokal/Google Colab gratis.
 
 ---
 
@@ -170,29 +181,72 @@ model.print_trainable_parameters()
 
 ---
 
-### ⚠️ Jebakan Umum
-
-**Jebakan 1: "LoRA rank yang lebih tinggi selalu lebih baik"**
-Rank lebih tinggi = lebih ekspresif, tapi juga lebih lambat dan bisa overfit pada dataset kecil. Mulai dengan r=8 atau r=16, lalu naik jika perlu.
-
-**Jebakan 2: "Satu LoRA adapter untuk semua task"**
-LoRA adapter spesifik untuk task yang ia latih. Adapter yang dilatih untuk teks hukum akan perform buruk pada teks medis. Untuk multi-task, kamu bisa train beberapa adapter terpisah dan swap-in sesuai kebutuhan.
-
-**Jebakan 3: "Quantization 4-bit selalu menghasilkan model yang sama baiknya"**
-Ada degradasi kualitas. Untuk task yang sangat butuh presisi (matematika, kode kompleks), 8-bit atau float16 mungkin lebih baik dari 4-bit meski lebih berat.
-
----
-
 ### 🧩 Latihan
 
 **Level 1 — Recall:**
-Jelaskan secara matematis mengapa LoRA bisa menghemat memori drastis. Berikan contoh numerik: berapa parameter yang dilatih untuk satu attention layer berukuran 4096×4096 dengan rank r=8?
+Jelaskan secara matematis mengapa dekomposisi low-rank $W_0 + B \times A$ menghemat memori GPU secara signifikan dibandingkan melatih ulang matriks $W_0$ secara utuh.
 
 **Level 2 — Aplikasi:**
-Jalankan kode di atas dengan model `Qwen/Qwen3-0.6B` (model kecil yang feasible). Ubah nilai `r` menjadi 4, 8, 16, dan 64. Catat jumlah trainable parameters di setiap setting. Plot hasilnya.
+Jalankan eksperimen Colab di bawah. Ubah rank `$r$` menjadi `1`, `4`, `16`, dan `32`. Catat bagaimana perubahan rank memengaruhi **Reconstruction Error** (kesalahan aproksimasi) dan jumlah **trainable parameter**. Plot datanya.
 
 **Level 3 — Eksplorasi:**
-Cari paper "LIMA: Less Is More for Alignment" (Zhou et al., 2023). Apa yang ditemukan tentang jumlah data yang diperlukan untuk fine-tuning yang baik? Bagaimana ini mengubah cara kamu akan merencanakan fine-tuning proyek?
+Mengapa pada model modern kita disarankan memilih opsi **All Linear Modules** untuk penempelan adaptor LoRA alih-alih hanya **Attention Modules (`q_proj`, `v_proj`)**? Bagaimana pengaruhnya terhadap stabilitas model pada tugas reasoning kompleks?
+
+---
+
+### 🔬 Eksperimen Google Colab: Visualisasi LoRA Rank Ablation
+
+Copy-paste kode ini ke Google Colab (CPU runtime) untuk memvisualisasikan bagaimana dekomposisi rank rendah mengaproksimasi perubahan matriks dan menghitung parameter efisiensi secara visual:
+
+```python
+# ============================================================
+# EKSPERIMEN: Visualisasi Low-Rank Approximation LoRA
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+np.random.seed(42)
+d = 64  # dimensi model (simulasi)
+
+# Buat perubahan weight delta_W ber-rank rendah asli (misal rank-4)
+true_rank = 4
+A_true = np.random.randn(d, true_rank) * 0.1
+B_true = np.random.randn(true_rank, d) * 0.1
+delta_W = A_true @ B_true
+
+# Hitung SVD untuk mendapatkan aproksimasi terbaik berbagai rank
+U, S, Vt = np.linalg.svd(delta_W, full_matrices=True)
+
+ranks_to_test = [1, 2, 4, 8, 16]
+errors = []
+
+fig, axes = plt.subplots(1, len(ranks_to_test) + 1, figsize=(20, 4))
+
+for i, r in enumerate(ranks_to_test):
+    delta_approx = U[:, :r] @ np.diag(S[:r]) @ Vt[:r, :]
+    error = np.linalg.norm(delta_W - delta_approx, 'fro') / np.linalg.norm(delta_W, 'fro')
+    errors.append(error)
+    
+    # Hitung rasio parameter
+    lora_params = 2 * d * r
+    full_params = d * d
+    compression = (lora_params / full_params) * 100
+    
+    ax = axes[i]
+    ax.imshow(delta_approx, cmap='coolwarm', vmin=-0.2, vmax=0.2)
+    ax.set_title(f"Rank {r}\nError: {error:.3f}\nParams: {compression:.1f}%")
+    ax.axis('off')
+
+# Plot matriks original
+axes[-1].imshow(delta_W, cmap='coolwarm', vmin=-0.2, vmax=0.2)
+axes[-1].set_title("Original ΔW\n(True Rank: 4)")
+axes[-1].axis('off')
+
+plt.suptitle("LoRA Low-Rank Reconstruction Analysis", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+```
 
 ---
 
@@ -200,12 +254,16 @@ Cari paper "LIMA: Less Is More for Alignment" (Zhou et al., 2023). Apa yang dite
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| Full Fine-Tuning | Latih semua parameter — mahal, tidak realistis untuk kebanyakan orang |
-| LoRA | Aproksimasi ΔW dengan matriks rank rendah; hemat 100x+ parameter |
-| QLoRA | LoRA + 4-bit quantization; fine-tune model besar dengan 1 GPU |
-| DoRA/rsLoRA | Variasi LoRA terbaru yang lebih stabil dan mendekati full fine-tuning |
-| r (rank) | Kapasitas LoRA; mulai dari 8-16, naik jika perlu |
+| **Full Fine-Tuning** | Melatih seluruh parameter model; sangat mahal dan membutuhkan VRAM GPU raksasa. |
+| **LoRA** | Menambahkan adaptor berupa dekomposisi matriks rank rendah ($B \times A$) untuk menguji perubahan bobot. |
+| **QLoRA** | Memadukan LoRA dengan pemuatan base model dalam presisi 4-bit (NF4) untuk efisiensi memori tingkat ekstrem. |
+| **Rank Heuristics** | Pilih rank `$r=8$` atau `$16$` untuk instruksi umum; perbesar ke `$r=32$` atau `$64$` untuk domain spesifik. |
+| **DoRA** | Memisahkan magnitude dan arah weight update untuk menghasilkan performa yang lebih stabil mendekati full fine-tuning. |
+| **Unsloth** | Framework optimal dengan CUDA kernel kustom yang mempercepat training hingga 2-5x lebih cepat di GPU. |
 
-> **Takeaway utama**: LoRA memdemokratisasi fine-tuning LLM. Kamu tidak butuh datacenter untuk melatih model domain-specific — cukup satu GPU dan data yang bagus.
+> **Takeaway utama**: LoRA mendemokratisasi proses kustomisasi LLM. Kamu tidak perlu memiliki supercomputer untuk melatih model domain-spesifik; cukup satu GPU consumer, teknik QLoRA, dan framework Unsloth.
+
+---
 
 **Selanjutnya → Modul 3.4: Evaluasi** — Bagaimana tahu kalau sistemmu bagus atau tidak?
+

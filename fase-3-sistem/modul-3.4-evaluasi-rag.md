@@ -53,18 +53,32 @@ Evaluasi RAG yang baik harus bisa **mendiagnosis di mana sistem gagal** — apak
 
 ### 📖 LLM-as-a-Judge: Evaluasi Berbasis AI
 
-Menilai "apakah jawaban ini faithful?" secara otomatis adalah tugas yang kompleks — terlalu rumit untuk rule-based metrics. Solusi modern: gunakan LLM yang kuat (Gemini 3.1 Pro, Claude Opus 4.8) sebagai *penilai otomatis*.
+Menilai "apakah jawaban ini faithful?" secara otomatis adalah tugas yang kompleks — terlalu rumit untuk rule-based metrics. Solusi modern: gunakan LLM yang kuat (seperti Gemini 1.5/2 Pro, Claude 3.5 Sonnet) sebagai **LLM-as-a-Judge (Penilai Otomatis)**.
 
-**Cara kerjanya (untuk Faithfulness)**:
-1. Berikan ke LLM-judge: context yang diambil + jawaban yang dihasilkan
-2. Prompt: *"Periksa setiap klaim dalam jawaban. Apakah setiap klaim bisa didukung oleh informasi dalam context? Beri penilaian 1-5 dan jelaskan."*
-3. Parse output LLM untuk mendapatkan skor
+#### Masalah: Bias pada LLM-as-a-Judge
+Meskipun andal, LLM-as-a-Judge memiliki bias internal yang harus kamu ketahui sebelum menggunakannya di produksi:
+1. **Verbosity Bias**: LLM cenderung memberi nilai lebih tinggi pada jawaban yang *panjang dan bertele-tele*, meskipun tingkat keakuratannya sama dengan jawaban yang padat dan singkat.
+2. **Self-Enhancement Bias**: Model cenderung memberi skor lebih tinggi pada jawaban yang ditulis oleh model itu sendiri dibandingkan model kompetitor (misalnya, Gemini menilai lebih ramah respon Gemini).
+3. **Position Bias (dalam Pairwise)**: Jika ditanya membandingkan dua jawaban (A vs B), model cenderung lebih sering memilih opsi yang diletakkan *di urutan pertama (A)*.
 
-**Kelemahan yang perlu disadari**:
-- LLM-judge bisa bias terhadap gaya bahasa yang formal atau panjang
-- LLM yang sama dengan yang digunakan untuk generate jawaban tidak baik sebagai judge (bias positif)
-- Masih ada ketidakkonsistenan — eval yang sama bisa memberi skor berbeda jika dijalankan dua kali
-- Pendekatan baru seperti **LLM-as-a-Judge with rubrics** dan **pairwise comparison** membantu mengurangi bias ini
+#### Strategi Mitigasi Bias di Produksi
+
+Untuk mengatasi bias tersebut, sistem evaluasi modern di 2026 menerapkan beberapa teknik berikut:
+
+##### A. Reference Rubrics (Evaluasi Berbasis Rubrik Detil)
+Alih-alih menyuruh LLM menilai secara umum (*"Beri nilai 1-5"*), kita memberikan **rubrik penilaian eksplisit** lengkap dengan definisi skor yang ketat:
+- **Skor 5**: Jawaban 100% benar secara faktual, menjawab semua bagian pertanyaan, dan didukung penuh oleh dokumen rujukan.
+- **Skor 3**: Jawaban benar sebagian, tetapi ada bagian kecil dari pertanyaan yang terlewat atau ada sedikit redundansi informasi.
+- **Skor 1**: Jawaban mengandung halusinasi fatal atau tidak relevan dengan query.
+
+##### B. Pairwise Comparison dengan Positional Swap
+Meminta LLM membandingkan Respon A vs Respon B secara langsung. Untuk memitigasi position bias, evaluasi dijalankan **dua kali**:
+- Run 1: Prompt membandingkan [Respon A, Respon B].
+- Run 2: Prompt membandingkan [Respon B, Respon A].
+- Jika model tidak konsisten memilih pemenang yang sama di kedua run tersebut, hasil dianggap seri (tie) atau dibuang.
+
+##### C. Chain-of-Thought (CoT) Judgement
+Prompt penilai wajib memaksa model menuliskan alasan/justifikasi langkah-demi-langkah *sebelum* mengeluarkan skor akhir JSON. Hal ini memaksa model melakukan penalaran logika yang konsisten dan mengurangi bias instan.
 
 ---
 
@@ -153,15 +167,84 @@ print(json.dumps(hasil, indent=2, ensure_ascii=False))
 
 ---
 
+### 🧩 Latihan
+
+**Level 1 — Recall:**
+Mengapa metrik evaluasi tradisional berbasis teks seperti BLEU atau ROUGE tidak cocok digunakan untuk mengevaluasi sistem RAG pada domain faktual?
+
+**Level 2 — Aplikasi:**
+Rancang sebuah prompt untuk metrik **Answer Relevance** menggunakan pendekatan **Chain-of-Thought (CoT)**. Evaluator harus membandingkan query pengguna dengan jawaban RAG, dan memberikan skor kelayakan relevansi dalam format JSON.
+
+**Level 3 — Eksplorasi:**
+Jelaskan fenomena **Verbosity Bias** pada LLM-as-a-Judge. Bagaimana kamu merancang prompt mitigasinya agar evaluator tidak memberikan nilai tinggi secara otomatis pada jawaban yang sangat panjang?
+
+---
+
+### 🔬 Eksperimen Google Colab: Implementasi LLM-as-a-Judge
+
+Copy-paste kode ini ke Google Colab (kamu memerlukan API Key Google Gemini atau penyedia LLM lainnya untuk menjalankannya secara nyata, namun kode ini menyediakan visualisasi framework evaluasinya):
+
+```python
+# ============================================================
+# EKSPERIMEN: LLM-as-a-Judge untuk Faithfulness (Halusinasi)
+# ============================================================
+
+import json
+
+# Data Uji RAG
+eval_dataset = [
+    {
+        "query": "Berapa hari jatah cuti karyawan?",
+        "context": "Setiap karyawan berhak atas 12 hari cuti per tahun yang diajukan 3 hari sebelumnya.",
+        "output": "Karyawan berhak mendapat 12 hari cuti setahun dan ada bonus cuti tambahan jika berprestasi."
+    }
+]
+
+def generate_evaluation_prompt(context, output):
+    return f"""
+    Kamu adalah evaluator RAG yang objektif. Tugasmu adalah menguji apakah output sistem mengandung halusinasi (fakta yang tidak didukung context).
+    
+    CONTEXT:
+    {context}
+    
+    OUTPUT SISTEM:
+    {output}
+    
+    Langkah Evaluasi (Chain-of-Thought):
+    1. Identifikasi klaim-klaim individual dari output sistem.
+    2. Verifikasi apakah setiap klaim didukung oleh context.
+    3. Hitung score = jumlah klaim terverifikasi / total klaim.
+    
+    Keluarkan JSON dengan format:
+    {{
+      "reasoning": "tulis penalaran langkah demi langkah di sini",
+      "claims": [
+        {{"claim": "...", "supported": true/false, "explanation": "..."}}
+      ],
+      "score": 0.XX
+    }}
+    """
+
+# Visualisasi prompt evaluasi yang dikirim ke LLM Judge
+prompt = generate_evaluation_prompt(eval_dataset[0]["context"], eval_dataset[0]["output"])
+print(prompt)
+```
+
+---
+
 ### 📝 Rangkuman
 
 | Konsep | Inti Pemahaman |
 |--------|---------------|
-| Faithfulness | Apakah jawaban hanya berisi info dari context? (deteksi halusinasi) |
-| Answer Relevance | Apakah jawaban menjawab pertanyaan? |
-| Context Precision/Recall | Kualitas dan kelengkapan retrieval |
-| LLM-as-a-Judge | Gunakan LLM kuat untuk menilai output LLM lain secara otomatis |
+| **Faithfulness** | Mengukur apakah jawaban bebas dari halusinasi (hanya menggunakan informasi dalam retrieved context). |
+| **Answer Relevance** | Mengukur seberapa tepat jawaban merespon esensi pertanyaan yang diajukan pengguna. |
+| **Context Precision/Recall** | Mengukur ketepatan dan kelengkapan dokumen yang diambil oleh modul retrieval. |
+| **LLM-as-a-Judge** | Penggunaan LLM berkemampuan tinggi (seperti Gemini Pro atau Claude Sonnet) sebagai evaluator otomatis. |
+| **Judge Bias** | Tantangan bias model (verbosity, position, self-enhancement); dimitigasi dengan reference rubrics dan positional swap. |
 
-> **Takeaway utama**: Evaluasi yang baik adalah yang bisa mendiagnosis di mana sistem gagal — bukan hanya memberikan satu angka.
+> **Takeaway utama**: Evaluasi RAG yang andal harus mengukur aspek retrieval dan generation secara terpisah. Menggunakan LLM-as-a-Judge dengan panduan rubrik terperinci (Reference Rubrics) adalah metode standar industri paling efektif untuk mengukur kualitas sistem di 2026.
+
+---
 
 **Selanjutnya → Fase 4: Agentic AI** — Dari sistem yang *menjawab* ke sistem yang *bertindak*.
+
